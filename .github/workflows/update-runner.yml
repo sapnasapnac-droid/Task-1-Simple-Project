@@ -20,11 +20,25 @@ jobs:
             - name: Install dependencies
               run: npm ci
             
-            - name: Verify installation
+            - name: Update dependencies
               run: |
-                echo "Top-level packages installed"
-                npm ls --depth=0
-                echo "Node_modules size"
-                du -sh node_modules
-                echo "Total package count"
-                ls node_modules | wc -l
+                npm install -g npm-check-updates
+                echo "Available updates" 
+                ncu
+                echo ""
+                echo "Applying updates"
+                ncu -u reject Faker, husky, marked --target minor
+                npm install
+            
+            - name: Create Pull Request
+              uses: peter-evans/create-pull-request@v6
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                commit-message: "chore: update dependencies"
+                title: "npm dependency update"
+                body: | 
+                    This PR updates the project dependencies to their latest versions.
+                    Run by the Dependency Update Runner workflow.
+                
+                branch: chore/update-dependencies
+                delete-branch: true
