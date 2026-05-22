@@ -1,0 +1,10 @@
+name: Dependency Update Runner
+on: 
+    workflow_dispatch:
+
+jobs:
+    update-runner:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Say hello
+              run: echo "Hello, this is the dependency update runner!"

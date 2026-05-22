@@ -1,0 +1,48 @@
+{
+  "name": "jsonplaceholder",
+  "version": "0.4.0",
+  "description": "A simple fake REST API server for testing and prototyping.",
+  "keywords": [
+    "fake",
+    "JSON",
+    "server",
+    "REST",
+    "dummy",
+    "data",
+    "API",
+    "testing",
+    "prototyping"
+  ],
+  "homepage": "http://jsonplaceholder.typicode.com",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/typicode/jsonplaceholder.git"
+  },
+  "scripts": {
+    "build": "node build",
+    "build:watch": "nodemon --watch build.js --watch templates -e js,md,html build.js",
+    "start": "node index",
+    "test": "node test/app",
+    "prepare": "husky"
+  },
+  "dependencies": {
+    "clone": "^2.1.2",
+    "json-server": "^0.17.4",
+    "marked": "^4.3.0"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "^8.4.1",
+    "husky": "^9.1.6",
+    "nodemon": "^3.1.7",
+    "pupa": "^2.1.1",
+    "rosie": "^2.1.0",
+    "showdown": "^2.1.0",
+    "supertest": "^7.0.0",
+    "tape": "^5.9.0",
+    "underscore": "^1.13.7"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
