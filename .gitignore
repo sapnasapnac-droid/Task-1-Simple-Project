@@ -1,0 +1,61 @@
+# =============================================================================
+# Node.js .gitignore
+# =============================================================================
+
+# Dependencies — installed locally, must never be committed
+node_modules/
+jspm_packages/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Diagnostic reports
+report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
+
+# Runtime data
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage and test outputs
+coverage/
+*.lcov
+.nyc_output/
+.grunt/
+
+# Cache directories
+.npm/
+.eslintcache
+.stylelintcache
+.cache/
+.parcel-cache/
+
+# Environment variables — NEVER commit secrets
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+dist/
+build/
+out/
+*.tsbuildinfo
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Husky (managed automatically; don't commit internal files)
+.husky/_/
