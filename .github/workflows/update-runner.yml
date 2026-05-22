@@ -8,3 +8,23 @@ jobs:
         steps:
             - name: Say hello
               run: echo "Hello, this is the dependency update runner!"
+
+            - name: Check repository
+              uses: actions/checkout@v4
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v3
+              with:
+                node-version: '20'
+            
+            - name: Install dependencies
+              run: npm ci
+            
+            - name: Verify installation
+              run: |
+                echo "Top-level packages installed"
+                npm ls --depth=0
+                echo "Node_modules size"
+                du -sh node_modules
+                echo "Total package count"
+                ls node_modules | wc -l
