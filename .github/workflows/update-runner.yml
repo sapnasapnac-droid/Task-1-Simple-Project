@@ -27,7 +27,7 @@ jobs:
                 ncu
                 echo ""
                 echo "Applying updates"
-                ncu -u --reject Faker, husky, marked --target minor
+                ncu -u --reject "Faker,husky,marked" --target minor
                 npm install
             
             - name: Create Pull Request
