@@ -6,6 +6,9 @@ on:
 jobs:
   update-runner:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Check repository
         uses: actions/checkout@v4
@@ -60,7 +63,7 @@ jobs:
             echo ""
             echo "❌ Install failed, looking for conflicts in the error..."
 
-            NEW=$(grep -oP "While resolving: \K[@a-z0-9/-]+" /tmp/install.log \
+            NEW=$(grep -oP "(While resolving|Could not resolve dependency:\s*peer\s+)\K[@a-z0-9/-]+" /tmp/install.log \
                   | sort -u \
                   | grep -v "^$" \
                   | tr '\n' ',' | sed 's/,$//')
@@ -96,7 +99,7 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           commit-message: "chore: update dependencies"
-          title: "npm dependency update"
+          title: "npm dependency update (self-healing, run #${{ github.run_number }})"
           body: |
             This PR updates the project dependencies to their latest versions.
             Run by the Dependency Update Runner workflow.
@@ -106,6 +109,6 @@ jobs:
 
             If any packages were auto-rejected, they had peer-dependency conflicts.
             They likely need to be updated manually as a coordinated group.
-          branch: chore/update-dependencies
+          branch: chore/deps-healing-${{ github.run_id }}
           delete-branch: true
           

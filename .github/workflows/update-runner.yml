@@ -5,6 +5,9 @@ on:
 jobs:
     update-runner:
         runs-on: ubuntu-latest
+        permissions:
+          contents: write
+          pull-requests: write
         steps:
             - name: Say hello
               run: echo "Hello, this is the dependency update runner!"
@@ -35,11 +38,11 @@ jobs:
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
                 commit-message: "chore: update dependencies"
-                title: "npm dependency update"
+                title: "npm dependency update (basic, run #${{ github.run_number }})"
                 body: | 
                     This PR updates the project dependencies to their latest versions.
                     Run by the Dependency Update Runner workflow.
                 
-                branch: chore/update-dependencies
+                branch: chore/deps-basic-${{ github.run_id }}
                 delete-branch: true
                 
