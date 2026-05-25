@@ -1,0 +1,98 @@
+# =============================================================================
+# Legacy CI Workflow
+# =============================================================================
+# Verifies the project installs and runs correctly on every push and PR.
+# This is the CI that runs on the auto-generated dependency update PRs too.
+#
+# Place this file at:  .github/workflows/legacy-ci.yml
+# =============================================================================
+
+name: Legacy CI
+
+on:
+  # Run on every push to main
+  push:
+    branches: [main]
+  # Run on every pull request targeting main
+  pull_request:
+    branches: [main]
+  # Allow manual triggering from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    name: Build and test
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Clone the repo onto the runner
+      # -----------------------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # Step 2: Install Node.js
+      # cache: 'npm' speeds up subsequent runs by reusing npm's cache
+      # -----------------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # -----------------------------------------------------------------------
+      # Step 3: Install dependencies from package-lock.json (deterministic)
+      # If this step fails, your lockfile is out of sync with package.json
+      # -----------------------------------------------------------------------
+      - name: Install dependencies
+        run: npm ci
+
+      # -----------------------------------------------------------------------
+      # Step 4: Show what got installed (useful for debugging CI logs)
+      # -----------------------------------------------------------------------
+      - name: List top-level dependencies
+        run: npm ls --depth=0
+
+      # -----------------------------------------------------------------------
+      # Step 5: Audit for known security vulnerabilities
+      # continue-on-error so audit findings don't block the build
+      # (you'll still see warnings in the log)
+      # -----------------------------------------------------------------------
+      - name: Security audit
+        run: npm audit --audit-level=high
+        continue-on-error: true
+
+      # -----------------------------------------------------------------------
+      # Step 6: Syntax-check the main entry points
+      # `node --check` parses a file without executing it. Fast smoke test.
+      # The `if` guards prevent failure when the files don't exist yet.
+      # -----------------------------------------------------------------------
+      - name: Syntax check
+        run: |
+          if [ -f index.js ]; then
+            echo "Checking index.js..."
+            node --check index.js
+          fi
+          if [ -f build.js ]; then
+            echo "Checking build.js..."
+            node --check build.js
+          fi
+          if [ -f test/app.js ]; then
+            echo "Checking test/app.js..."
+            node --check test/app.js
+          fi
+
+      # -----------------------------------------------------------------------
+      # Step 7: Run tests (only if a test file exists)
+      # If you don't have tests yet, this step warns but doesn't fail.
+      # Once tests exist, remove the `if` check to make tests required.
+      # -----------------------------------------------------------------------
+      - name: Run tests
+        run: |
+          if [ -f test/app.js ]; then
+            npm test
+          else
+            echo "::warning::No test/app.js found — skipping tests."
+            echo "::warning::Add tests to make CI actually verify behavior."
+          fi
