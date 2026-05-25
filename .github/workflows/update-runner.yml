@@ -1,111 +1,44 @@
 name: Dependency Update Runner
-
-on:
-  workflow_dispatch:
+on: 
+    workflow_dispatch:
 
 jobs:
-  update-runner:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check repository
-        uses: actions/checkout@v4
+    update-runner:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Say hello
+              run: echo "Hello, this is the dependency update runner!"
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+            - name: Check repository
+              uses: actions/checkout@v4
 
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Update dependencies 
-        id: update
-        run: |
-          set +e              # do not exit on command failure; we are handling errors further in the script
-
-          npm install -g npm-check-updates
-
-          cp package.json /tmp/pkg.orig
-          cp package-lock.json /tmp/lock.orig
-
-          REJECT_LIST=""
-          MAX_ATTEMPTS=5
-
-          for attempt in $(seq 1 $MAX_ATTEMPTS); do
-            echo ""
-            echo "===== Attempt $attempt of $MAX_ATTEMPTS ====="
-
-            cp /tmp/pkg.orig package.json
-            cp /tmp/lock.orig package-lock.json
-
-            if [ -z "$REJECT_LIST" ]; then
-              echo "Updating all packages (no rejects yet)"
-              ncu -u --target minor
-            else
-              echo "Updating packages, rejecting: $REJECT_LIST"
-              ncu -u --target minor --reject "$REJECT_LIST"
-            fi
-
-            npm install 2>&1 | tee /tmp/install.log
-            INSTALL_EXIT=${PIPESTATUS[0]}
-
-            if [ $INSTALL_EXIT -eq 0 ]; then
-              echo ""
-              echo "✅ Install succeeded on attempt $attempt"
-              echo "rejected=$REJECT_LIST" >> $GITHUB_OUTPUT
-              echo "attempts=$attempt" >> $GITHUB_OUTPUT
-              exit 0
-            fi
-
-            echo ""
-            echo "❌ Install failed, looking for conflicts in the error..."
-
-            NEW=$(grep -oP "While resolving: \K[@a-z0-9/-]+" /tmp/install.log \
-                  | sort -u \
-                  | grep -v "^$" \
-                  | tr '\n' ',' | sed 's/,$//')
-
-            if [ -z "$NEW" ]; then
-              echo "Could not identify a conflicting package from the error."
-              echo "Full error log:"
-              cat /tmp/install.log
-              exit 1
-            fi
-
-            echo "🔎 Discovered new conflict(s): $NEW"
-
-            if [ -z "$REJECT_LIST" ]; then
-              REJECT_LIST="$NEW"
-            else
-              REJECT_LIST=$(echo "$REJECT_LIST,$NEW" \
-                            | tr ',' '\n' \
-                            | sort -u \
-                            | tr '\n' ',' \
-                            | sed 's/,$//')
-            fi
-          done
-
-          echo ""
-          echo "❌ Could not resolve all conflicts in $MAX_ATTEMPTS attempts."
-          echo "Final reject list was: $REJECT_LIST"
-          exit 1
-
-  
-      - name: Create Pull Request
-        if: success()
-        uses: peter-evans/create-pull-request@v6
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: update dependencies"
-          title: "npm dependency update"
-          body: |
-            This PR updates the project dependencies to their latest versions.
-            Run by the Dependency Update Runner workflow.
-
-            **Resolution attempts:** ${{ steps.update.outputs.attempts }}
-            **Auto-rejected packages:** `${{ steps.update.outputs.rejected || 'none' }}`
-
-            If any packages were auto-rejected, they had peer-dependency conflicts.
-            They likely need to be updated manually as a coordinated group.
-          branch: chore/update-dependencies
-          delete-branch: true
+            - name: Set up Node.js
+              uses: actions/setup-node@v4
+              with:
+                node-version: '22'
+            
+            - name: Install dependencies
+              run: npm ci
+            
+            - name: Update dependencies
+              run: |
+                npm install -g npm-check-updates
+                echo "Available updates" 
+                ncu
+                echo ""
+                echo "Applying updates"
+                ncu -u --reject "Faker,husky,marked" --target minor
+                npm install
+            
+            - name: Create Pull Request
+              uses: peter-evans/create-pull-request@v6
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                commit-message: "chore: update dependencies"
+                title: "npm dependency update"
+                body: | 
+                    This PR updates the project dependencies to their latest versions.
+                    Run by the Dependency Update Runner workflow.
+                
+                branch: chore/update-dependencies
+                delete-branch: true
