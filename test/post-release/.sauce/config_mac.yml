@@ -1,0 +1,39 @@
+apiVersion: v1
+kind: cypress
+sauce:
+  region: us-west-1
+  concurrency: 2
+  metadata:
+    tags:
+      - e2e
+      - post release
+    build: Github Run $GITHUB_RUN_ID
+cypress:
+  configFile: cypress.config.js
+  version: 14.5.2
+rootDir: ./
+env:
+  foo: bar
+suites:
+  - name: "Post Release Test (MacOS) 1/2"
+    browser: "chrome"
+    platformName: "macOS 12"
+    config:
+      testingType: "e2e"
+      specPattern: [ "cypress/**/*.*" ]
+# Comment mac + firefox test due to constant failure
+#  - name: "Post Release Test (MacOS) 2/2"
+#    browser: "firefox"
+#    platformName: "macOS 12"
+#    config:
+#      testingType: "e2e"
+#      specPattern: [ "cypress/**/*.*" ]
+#
+notifications:
+  slack:
+    channels: ["devx"]
+    send: fail
+
+npm:
+  packages:
+    cypress-plugin-steps: '1.1.0'
