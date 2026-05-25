@@ -1,0 +1,319 @@
+name: Release New Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      releaseType:
+        description: "Release type - major, minor or patch"
+        required: false
+        default: ""
+      preReleaseFlavor:
+        description: "Pre-Release flavor - rc, beta, or anything"
+        required: false
+        default: ""
+
+jobs:
+  create-release-draft:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Tag
+        id: prep
+        run: |
+          TAG_NAME=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .tag_name | select (. != null)")
+          IS_DRAFT=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .draft | select (. != null)")
+
+          if [ -n "${TAG_NAME}" ] && [ "${IS_DRAFT}" == "false" ];then
+              echo "A release has already been published for this run_id (${{ github.run_id }} / ${TAG_NAME})."
+              exit 1
+          fi
+
+          echo "tag_name=${TAG_NAME}" >> $GITHUB_OUTPUT
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        if: ${{ steps.prep.outputs.tag_name == '' }}
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Setup Node
+        if: ${{ steps.prep.outputs.tag_name == '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Setup Git
+        if: ${{ steps.prep.outputs.tag_name == '' }}
+        run: |
+          git config --global user.name "devx-sauce-bot"
+          git config --global user.email "devx.bot@saucelabs.com"
+
+      - name: Install Dependencies
+        if: ${{ steps.prep.outputs.tag_name == '' }}
+        run: npm ci
+
+      - name: Generate (Pre-)Release Draft
+        if: ${{ steps.prep.outputs.tag_name == '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ -z "${{ github.event.inputs.releaseType }}" ] && [ -z "${{ github.event.inputs.preReleaseFlavor }}" ];then
+            echo "No release type provided."
+            exit 1
+          fi
+
+          RELEASE_TYPE="${{ github.event.inputs.releaseType }}"
+
+          if [ -n "${{ github.event.inputs.preReleaseFlavor }}" ];then
+            LATEST_TAG=$(gh release list --limit 1 --json tagName --jq '.[] | .tagName')
+            # NOTE: Expected tag format is {VERSION}-{FLAVOR}.{FLAVOR_VERSION}
+            LATEST_FLAVOR=$(echo ${LATEST_TAG} | awk -F'-' '{ print $2 }' | awk -F'.' '{ print $1 }')
+
+            if [ "${LATEST_FLAVOR}" == "${{ github.event.inputs.preReleaseFlavor}}" ];then
+              # NOTE: If the inputted pre-release flavor matches the current pre-release flavor, we only
+              # want to increment the pre-release version instead of a full version bump.
+              PRE_RELEASE_ARGS="--preRelease"
+              RELEASE_TYPE=""
+            else
+              PRE_RELEASE_ARGS="--preRelease=${{ github.event.inputs.preReleaseFlavor }} --github.preRelease"
+            fi
+          fi
+
+          npx release-it ${RELEASE_TYPE} ${PRE_RELEASE_ARGS}
+
+
+  release-windows-bundle:
+    runs-on: windows-latest
+    needs: [create-release-draft]
+    steps:
+      - name: Find Matching Draft Tag
+        # Fetches the `asset_id` of the uploaded bundle. A non-empty `asset_id` signals a successful upload, preventing duplicate uploads in retry attempts.
+        id: prep
+        run: |
+          $res = Invoke-WebRequest -Uri "https://api.github.com/repos/${{ github.repository }}/releases" -Headers @{'Authorization' = "token ${{ github.token }}"}
+          $jsonObj = ConvertFrom-Json $([String]::new($res.Content))
+
+          $selectedRelease = $null
+          Foreach ($release in $jsonObj)
+          {
+              if ( ! $release.body -contains "- jobId: ${{ github.run_id }}}\\n") {
+                  continue
+              }
+              if ( ! $release.draft ) {
+                  continue
+              }
+              $selectedRelease = $release
+              break
+          }
+
+          if ( $null -eq $selectedRelease ) {
+              exit 1
+          }
+
+          $selectedAsset = $null
+          Foreach ($asset in $selectedRelease.assets) {
+            if ($asset.name -eq "cypress-windows-amd64.zip") {
+              $selectedAsset = $asset
+            }
+          }
+
+          $tagName = $selectedRelease.tag_name
+          $releaseId = $selectedRelease.id
+          $assetId = $selectedAsset.id
+
+          echo "version=$tagName" >> $Env:GITHUB_OUTPUT
+          echo "release_id=$releaseId" >> $Env:GITHUB_OUTPUT
+          echo "asset_id=$assetId" >> $Env:GITHUB_OUTPUT
+
+      - run: Write-Output "${{ steps.prep.outputs.release_id }} - ${{ steps.prep.outputs.version }} - ${{ steps.prep.outputs.asset_id }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        with:
+          ref: ${{ steps.prep.outputs.version }}
+
+      - name: Setup Node
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Update Release Version
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: |
+          npm version --no-git-tag-version ${{  steps.prep.outputs.version }}
+
+      - name: Bundle Directory
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: bash ./scripts/bundle.windows.sh
+
+      - name: List Bundle Contents
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: ls -R bundle/
+
+      - name: Upload Release Asset
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ steps.prep.outputs.version }} cypress-windows-amd64.zip
+
+  release-macos-bundle:
+    # macos-15-intel for amd64 builds
+    runs-on: macos-15-intel
+    needs: [create-release-draft]
+    steps:
+      - name: Find Matching Draft Tag
+        # Fetches the `asset_id` of the uploaded bundle. A non-empty `asset_id` signals a successful upload, preventing duplicate uploads in retry attempts.
+        id: prep
+        run: |
+          VERSION=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.draft == true) | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .tag_name")
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.draft == true) | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .id")
+
+          if [ "${VERSION}" = "" ];then
+              echo "No draft version found"
+              exit 1
+          fi
+
+          ASSET_ID=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .assets | .[] | select(.name == \"cypress-macos-amd64.zip\") | .id | select(. != null)")
+
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+          echo "release_id=${RELEASE_ID}" >> $GITHUB_OUTPUT
+          echo "asset_id=${ASSET_ID}" >> $GITHUB_OUTPUT
+
+      - run: echo "${{ steps.prep.outputs.release_id }} - ${{ steps.prep.outputs.version }} - ${{ steps.prep.outputs.asset_id }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        with:
+          ref: ${{ steps.prep.outputs.version }}
+
+      - name: Setup Node
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Update Release Version
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: |
+          npm version --no-git-tag-version ${{  steps.prep.outputs.version }}
+
+      - name: Bundle Directory
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: bash ./scripts/bundle.macos.sh
+
+      - name: List Bundle Contents
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        run: ls -R bundle/
+
+      - name: Upload Release Asset
+        if: ${{ steps.prep.outputs.asset_id == '' }}
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload ${{ steps.prep.outputs.version }} cypress-macos-amd64.zip
+
+  publish-release:
+    runs-on: ubuntu-latest
+    needs: [release-windows-bundle, release-macos-bundle]
+    steps:
+      - name: Find Matching Draft Tag
+        id: prep
+        run: |
+          RELEASE_ID=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.draft == true) | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .id")
+
+          if [ "${RELEASE_ID}" = "" ];then
+              echo "No draft version found"
+              exit 1
+          fi
+
+          echo "release_id=${RELEASE_ID}" >> $GITHUB_OUTPUT
+
+      - name: Publish Release
+        run: |
+          curl -f -X PATCH -H "Authorization: token ${{ github.token }}" \
+            https://api.github.com/repos/${{ github.repository }}/releases/${{ steps.prep.outputs.release_id }} \
+            -d '{"draft":"false"}'
+
+  # Post Deploy Tests
+  post-release-windows-tests:
+    runs-on: ubuntu-latest
+    needs: publish-release
+    env:
+      SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}
+      SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup saucectl
+        uses: saucelabs/saucectl-run-action@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          skip-run: true
+
+      - name: Parse Release Version
+        id: parse_version
+        run: |
+          VERSION=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .tag_name")
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Cloud Tests
+        working-directory: ./tests/post-release
+        run: |
+          saucectl run --runner-version "url: https://github.com/saucelabs/sauce-cypress-runner/releases/download/${{ steps.parse_version.outputs.version }}/cypress-windows-amd64.zip" --config ./.sauce/config_win.yml
+
+  post-release-macos-tests:
+    runs-on: ubuntu-latest
+    needs: publish-release
+    env:
+      SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}
+      SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup saucectl
+        uses: saucelabs/saucectl-run-action@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          skip-run: true
+
+      - name: Parse Release Version
+        id: parse_version
+        run: |
+          VERSION=$(curl -s -H "Authorization: token ${{ github.token }}" \
+                      https://api.github.com/repos/${{ github.repository }}/releases | \
+                      jq -r "[.[] | select(.body | contains(\"- jobId: ${{ github.run_id }}\\n\"))] | first | .tag_name")
+
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Cloud Tests
+        working-directory: ./tests/post-release
+        run: |
+          saucectl run --runner-version "url: https://github.com/saucelabs/sauce-cypress-runner/releases/download/${{ steps.parse_version.outputs.version }}/cypress-macos-amd64.zip" --config ./.sauce/config_mac.yml
