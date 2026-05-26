@@ -24,7 +24,7 @@ jobs:
               run: npm ci
 
             - name: Format code with Prettier
-              run: npm run format 
+              run: npm run fmt
             
             - name: Update dependencies
               run: |
@@ -37,7 +37,7 @@ jobs:
                 npm install
 
             - name: Format code after updates
-              run: npm run format
+              run: npm run fmt
             
             - name: Create Pull Request
               uses: peter-evans/create-pull-request@v6
