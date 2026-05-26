@@ -9,4 +9,64 @@ updates:
     # Disable version updates. We only want security.
     open-pull-requests-limit: 0
     labels:
-      - dependencies
+      - dependencies# .github/dependabot.yml
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------------
+  # npm dependencies
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "npm"
+    directory: "/"                  # where package.json lives
+    schedule:
+      interval: "monthly"           # weekly, daily, monthly
+      day: "monday"                 # for weekly schedules
+    open-pull-requests-limit: 5     # avoid PR spam
+    
+    # Group related updates into single PRs
+    groups:
+      # All dev dependencies in one PR
+      development-dependencies:
+        dependency-type: "development"
+        update-types:
+          - "patch"
+          - "minor"
+      
+      # All production deps in one PR
+      production-dependencies:
+        dependency-type: "production"
+        update-types:
+          - "patch"
+          - "minor"
+    
+    # Don't auto-update these — too risky
+    ignore:
+      - dependency-name: "husky"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "marked"
+        update-types: ["version-update:semver-major"]
+    
+    # Add reviewers automatically (optional)
+    # reviewers:
+    #   - "your-github-username"
+    
+    # Custom labels on the PRs
+    labels:
+      - "dependencies"
+      - "automated"
+    
+    # PR title format
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+
+  # ---------------------------------------------------------------------------
+  # GitHub Actions versions (e.g., actions/checkout@v4 → @v5)
+  # ---------------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"                  # checks .github/workflows/*
+    schedule:
+      interval: "monthly"
+    labels:
+      - "github-actions"
+      - "automated"
