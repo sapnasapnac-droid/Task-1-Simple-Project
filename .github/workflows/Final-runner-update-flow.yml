@@ -1,0 +1,169 @@
+name: Robust Dependency Update Flow
+on:
+    workflow_dispatch:
+
+jobs:
+    update:
+
+        runs-on: ubuntu-latest
+        env:
+            HUSKY: 0
+        permissions:
+            contents: write
+            pull-requests: write
+            issues: write
+
+        steps:
+
+            - name: Checkout code
+              uses: actions/checkout@v5
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v5
+              with:
+                node-version: '20'
+                cache: 'npm'
+
+            - name: Install dependencies
+              run: |
+                set -o pipefail
+                npm ci 2>1 | tee /tmp/install.log
+            
+            - name: Update dependencies
+              id: update
+              run: |
+                set -o pipefail
+                npm install -g npm-check-updates
+
+                cp package.json /tmp/pkg.orig
+                cp package-lock.json /tmp/lock.orig
+
+                OUR_DEPS=$(jq -r '.dependencies, .devDependencies | keys[]' package.json | sort -u)
+
+                REJECT_LIST=""
+                MAX_ATTEMPTS=20
+
+                for attempt in $(seq 1 $MAX_ATTEMPTS); do
+                    echo ""
+                    echo "Attempt $attempt of $MAX_ATTEMPTS"
+
+                    rm -rf node_modules
+                    cp /tmp/pkg.orig package.json
+                    cp /tmp/lock.orig package-lock.json
+
+                    if [ -z "$REJECT_LIST" ]; then
+                        echo "No dependencies to reject. Updating all dependencies."
+                        ncu -u --target minor
+                    else
+                        echo "Updating dependencies, rejecting: $REJECT_LIST"
+                        ncu -u --target minor --reject "$REJECT_LIST"
+                    fi
+
+                    npm install 2>1 | tee /tmp/install.log
+                    INSTALL_EXIT_CODE=${PIPESTATUS[0]}
+
+                    if [ $INSTALL_EXIT -eq 0 ]; then
+                        echo "✅ Install succeeded on attempt $attempt"
+                        echo "rejected=$REJECT_LIST" >> $GITHUB_OUTPUT
+                        echo "attempts=$attempt" >> $GITHUB_OUTPUT
+                        exit 0
+                    fi
+
+                    if grep -qE "ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN" /tmp/install.log; then
+                        echo "::warning::Network issue detected, retrying same install in 10s"
+                        sleep 10
+                        continue
+                    fi
+
+                    if ! grep -q "ERESOLVE" /tmp/install.log; then
+                        echo "::error::Non-ERESOLVE failure — not retriable"
+                        cat /tmp/install.log
+                        exit 1
+                    fi
+
+                    CANDIDATES=$( {
+                        grep -oP "Conflicting peer dependency: \K[@a-z0-9/-]+" /tmp/install.log
+                        grep -oP "peer \K[@a-z0-9/-]+(?=@)" /tmp/install.log
+                        grep -oP "Found: \K[@a-z0-9/-]+(?=@)" /tmp/install.log
+                    } | sort -u)
+                    
+                    NEW=""
+                    for pkg in $CANDIDATES; do
+                        if echo "$OUR_DEPS" | grep -qx "$pkg"; then
+                            if ! echo ",$REJECT_LIST," | grep -q ",$pkg,"; then
+                                NEW="$NEW,$pkg"
+                            fi
+                        fi
+                    done
+                    NEW=$(echo "$NEW" | sed 's/^,//')
+
+                    if [ -z "$NEW" ]; then
+                        echo "::error::Conflict detected but no new actionable packages found"
+                        echo "Attempts: $attempt"
+                        echo "Reject list at exit: $REJECT_LIST"
+                        cat /tmp/install.log
+                        exit 1
+                    fi
+
+                    echo "🔎 Adding to reject list: $NEW"
+                    if [ -z "$REJECT_LIST" ]; then
+                        REJECT_LIST="$NEW"
+                    else
+                        REJECT_LIST="$REJECT_LIST,$NEW"
+                    fi
+                done
+
+                echo "::error::Failed to resolve dependencies after $MAX_ATTEMPTS attempts"
+                echo "Final reject list: $REJECT_LIST"
+                exit 1
+
+            - name: Check for changes
+              id: changed
+              run: |
+                if git diff --quiet package.json package-lock.json; then
+                    echo "had_changes=false" >> $GITHUB_OUTPUT
+                    echo "::notice::No dependency updates were available this run"
+                else
+                    echo "had_changes=true" >> $GITHUB_OUTPUT
+                    echo "Changes detected — will create PR"
+                fi
+
+            - name: Run tests on updated dependencies
+              id: test
+              if: steps.changed.outputs.had_changes == 'true'
+              continue-on-error: true
+              run: |
+                if [ -n "$(npm pkg get scripts.test | grep -v '^{}$')" ]; then
+                    npm test
+                else
+                    echo "::notice::No test script defined — skipping test verification"
+                    exit 0
+                fi
+
+            - name: Create Pull Request
+              if: steps.changed.outputs.had_changes == 'true'
+              uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                commit-message: "chore: dependency update"
+                title: |
+                  ${{ steps.test.outcome == 'failure' && '⚠️ [TESTS FAILING] Dependency update' || 'chore: Dependency update' }}
+                labels: |
+                  ${{ steps.test.outcome == 'failure' && 'dependencies,needs-review,tests-failing' || 'dependencies,automated' }}
+                body: |
+                    Automatic dependency update via self-healing workflow.
+
+                    ## Update Summary
+                    - **Attempts to resolve conflicts:** ${{ steps.update.outputs.attempts }}
+                    - **Auto-rejected packages:** `${{ steps.update.outputs.rejected || 'none — all updates clean' }}`
+                    - **Test result:** ${{ steps.test.outcome }}
+
+                    ## Review Guidance
+                    ${{ steps.test.outcome == 'failure' && '⚠️ **Tests failed.** Investigate before merging.' || '✅ Tests passed.' }}
+                    ${{ steps.update.outputs.rejected != '' && format('⚠️ **Auto-rejected packages had peer-dependency conflicts.** They may need a coordinated manual update.') || '' }}
+
+                    Generated by run #${{ github.run_number }}.
+                branch: chore/deps-${{ github.run_id }}
+                delete-branch: true
+
+
