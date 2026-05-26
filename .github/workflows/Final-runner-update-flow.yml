@@ -128,6 +128,18 @@ jobs:
                     echo "Changes detected — will create PR"
                 fi
 
+            - name: Build the project
+              if: steps.changed.outputs.had_changes == 'true'
+              run: |
+                if [ -n "$(npm pkg get scripts.build | grep -v '^{}$')" ]; then
+                    echo "Running build..."
+                    npm run build
+                    echo "Build complete. Verifying output..."
+                    ls -la lib/ || echo "::warning::lib/ directory was not created"
+                else
+                    echo "::notice::No build script defined — skipping build"
+                fi
+
             - name: Run tests on updated dependencies
               id: test
               if: steps.changed.outputs.had_changes == 'true'
