@@ -62,7 +62,7 @@ jobs:
                     npm install 2>1 | tee /tmp/install.log
                     INSTALL_EXIT_CODE=${PIPESTATUS[0]}
 
-                    if [ $INSTALL_EXIT -eq 0 ]; then
+                    if [ $INSTALL_EXIT_CODE -eq 0 ]; then
                         echo "✅ Install succeeded on attempt $attempt"
                         echo "rejected=$REJECT_LIST" >> $GITHUB_OUTPUT
                         echo "attempts=$attempt" >> $GITHUB_OUTPUT
