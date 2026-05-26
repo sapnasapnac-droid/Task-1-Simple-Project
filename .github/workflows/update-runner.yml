@@ -22,9 +22,6 @@ jobs:
             
             - name: Install dependencies
               run: npm ci
-
-            - name: Format code with Prettier
-              run: npm run fmt
             
             - name: Update dependencies
               run: |
@@ -35,9 +32,6 @@ jobs:
                 echo "Applying updates"
                 ncu -u --reject "Faker,husky,marked" --target minor
                 npm install
-
-            - name: Format code after updates
-              run: npm run fmt
             
             - name: Create Pull Request
               uses: peter-evans/create-pull-request@v6
