@@ -1,8 +1,9 @@
 # =============================================================================
 # Legacy CI Workflow
 # =============================================================================
-# Verifies the project installs and runs correctly on every push and PR.
-# This is the CI that runs on the auto-generated dependency update PRs too.
+# Validates that the project builds, lints, and passes its local tests on
+# every push and PR. Cloud tests (Sauce Labs) are NOT run here — they need
+# secrets and a different setup.
 #
 # Place this file at:  .github/workflows/legacy-ci.yml
 # =============================================================================
@@ -10,89 +11,174 @@
 name: Legacy CI
 
 on:
-  # Run on every push to main
   push:
     branches: [main]
-  # Run on every pull request targeting main
   pull_request:
     branches: [main]
-  # Allow manual triggering from the Actions tab
   workflow_dispatch:
 
+# Disable husky hooks globally for this CI run.
+# Husky's pre-commit/pre-push hooks are meant for human developers — they have
+# no useful purpose during CI, and as you've seen, they can interfere when
+# tools like prettier get updated and re-flag existing files.
+env:
+  HUSKY: 0
+
 jobs:
-  build-and-test:
+  # ---------------------------------------------------------------------------
+  # Job 1: Build, lint, and unit tests (fast feedback)
+  # ---------------------------------------------------------------------------
+  build-and-lint:
     runs-on: ubuntu-latest
-    name: Build and test
+    name: Build, lint, unit tests
 
     steps:
-      # -----------------------------------------------------------------------
-      # Step 1: Clone the repo onto the runner
-      # -----------------------------------------------------------------------
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      # -----------------------------------------------------------------------
-      # Step 2: Install Node.js
-      # cache: 'npm' speeds up subsequent runs by reusing npm's cache
-      # -----------------------------------------------------------------------
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '20'
           cache: 'npm'
 
-      # -----------------------------------------------------------------------
-      # Step 3: Install dependencies from package-lock.json (deterministic)
-      # If this step fails, your lockfile is out of sync with package.json
-      # -----------------------------------------------------------------------
       - name: Install dependencies
         run: npm ci
 
-      # -----------------------------------------------------------------------
-      # Step 4: Show what got installed (useful for debugging CI logs)
-      # -----------------------------------------------------------------------
-      - name: List top-level dependencies
+      - name: List top-level dependencies (debug aid)
         run: npm ls --depth=0
+        continue-on-error: true
 
-      # -----------------------------------------------------------------------
-      # Step 5: Audit for known security vulnerabilities
-      # continue-on-error so audit findings don't block the build
-      # (you'll still see warnings in the log)
-      # -----------------------------------------------------------------------
+      # Lint: prettier --check + eslint (same as husky pre-commit)
+      - name: Lint
+        run: npm run lint
+
+      # Build: compile TypeScript in src/ (if a build script exists)
+      - name: Build
+        run: |
+          if [ -n "$(npm pkg get scripts.build | grep -v '^{}$')" ]; then
+            npm run build
+          else
+            echo "No build script found — skipping"
+          fi
+
+      # Unit tests (Jest, based on jest-config.js)
+      - name: Unit tests
+        run: |
+          if [ -n "$(npm pkg get scripts.test | grep -v '^{}$')" ]; then
+            npm test
+          else
+            echo "::warning::No test script defined"
+          fi
+
+      # Security audit — report-only, doesn't block the build
       - name: Security audit
         run: npm audit --audit-level=high
         continue-on-error: true
 
-      # -----------------------------------------------------------------------
-      # Step 6: Syntax-check the main entry points
-      # `node --check` parses a file without executing it. Fast smoke test.
-      # The `if` guards prevent failure when the files don't exist yet.
-      # -----------------------------------------------------------------------
-      - name: Syntax check
+  # ---------------------------------------------------------------------------
+  # Job 2: Integration tests (test/integration/)
+  # Only runs if Job 1 passed.
+  # ---------------------------------------------------------------------------
+  integration-tests:
+    runs-on: ubuntu-latest
+    name: Integration tests
+    needs: build-and-lint
+    if: github.event.pull_request.draft == false
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
         run: |
-          if [ -f index.js ]; then
-            echo "Checking index.js..."
-            node --check index.js
-          fi
-          if [ -f build.js ]; then
-            echo "Checking build.js..."
-            node --check build.js
-          fi
-          if [ -f test/app.js ]; then
-            echo "Checking test/app.js..."
-            node --check test/app.js
+          if [ -n "$(npm pkg get scripts.build | grep -v '^{}$')" ]; then
+            npm run build
           fi
 
-      # -----------------------------------------------------------------------
-      # Step 7: Run tests (only if a test file exists)
-      # If you don't have tests yet, this step warns but doesn't fail.
-      # Once tests exist, remove the `if` check to make tests required.
-      # -----------------------------------------------------------------------
-      - name: Run tests
+      # System libs Cypress needs to run a headless browser on Ubuntu
+      - name: Install Cypress system dependencies
         run: |
-          if [ -f test/app.js ]; then
-            npm test
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgtk2.0-0 libgtk-3-0 libgbm-dev libnotify-dev \
+            libnss3 libxss1 libasound2 libxtst6 xauth xvfb
+
+      - name: Cache Cypress binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/Cypress
+          key: cypress-${{ runner.os }}-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            cypress-${{ runner.os }}-
+
+      # Run the integration test orchestrator
+      - name: Run integration tests
+        run: |
+          if [ -f test/integration/integrations-test.sh ]; then
+            chmod +x test/integration/integrations-test.sh
+            bash test/integration/integrations-test.sh
           else
-            echo "::warning::No test/app.js found — skipping tests."
-            echo "::warning::Add tests to make CI actually verify behavior."
+            echo "::warning::integrations-test.sh not found — skipping"
           fi
+
+      # On failure, save Cypress artifacts so you can debug
+      - name: Upload Cypress artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cypress-failure-artifacts
+          path: |
+            test/**/cypress/screenshots
+            test/**/cypress/videos
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # Job 3: Cloud config validation (no actual cloud run)
+  # Verifies the .sauce/*.yml configs parse without errors.
+  # Real cloud test runs need Sauce credentials and are run separately.
+  # ---------------------------------------------------------------------------
+  cloud-config-check:
+    runs-on: ubuntu-latest
+    name: Cloud config validation
+    needs: build-and-lint
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Validate all Sauce config YAML files parse correctly
+      - name: Validate Sauce configs
+        run: |
+          echo "Validating Sauce Labs config files..."
+          FAILED=0
+          for config in $(find test -name "config*.yml" 2>/dev/null); do
+            echo "Checking $config"
+            if ! python3 -c "import yaml; yaml.safe_load(open('$config'))" 2>&1; then
+              echo "::error file=$config::Invalid YAML"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -eq 1 ]; then
+            exit 1
+          fi
+          echo "✅ All Sauce configs are valid YAML"
