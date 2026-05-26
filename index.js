@@ -23,7 +23,7 @@ function generateUsers(count) {
       name: faker.person.fullName(),
       username: faker.internet.userName(),
       email: faker.internet.email(),
-      city: faker.location.city()
+      city: faker.location.city(),
     });
   }
   return users;
@@ -36,7 +36,7 @@ function generatePosts(count, userCount) {
       id: i,
       userId: faker.number.int({ min: 1, max: userCount }),
       title: faker.lorem.sentence(),
-      body: faker.lorem.paragraph()
+      body: faker.lorem.paragraph(),
     });
   }
   return posts;
@@ -47,7 +47,7 @@ function generateDatabase() {
   const postCount = 20;
   return {
     users: generateUsers(userCount),
-    posts: generatePosts(postCount, userCount)
+    posts: generatePosts(postCount, userCount),
   };
 }
 

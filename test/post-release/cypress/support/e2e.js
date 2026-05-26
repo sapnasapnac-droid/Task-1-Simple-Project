@@ -1,1 +1,1 @@
-require("cypress-plugin-steps");
+require('cypress-plugin-steps');
