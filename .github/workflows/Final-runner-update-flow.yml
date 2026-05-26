@@ -27,7 +27,7 @@ jobs:
             - name: Install dependencies
               run: |
                 set -o pipefail
-                npm ci 2>1 | tee /tmp/install.log
+                npm ci 2>&1 | tee /tmp/install.log
             
             - name: Update dependencies
               id: update
@@ -59,7 +59,7 @@ jobs:
                         ncu -u --target minor --reject "$REJECT_LIST"
                     fi
 
-                    npm install 2>1 | tee /tmp/install.log
+                    npm install 2>&1 | tee /tmp/install.log
                     INSTALL_EXIT_CODE=${PIPESTATUS[0]}
 
                     if [ $INSTALL_EXIT_CODE -eq 0 ]; then
