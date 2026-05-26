@@ -1,0 +1,293 @@
+name: Test
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  SAUCE_ACCESS_KEY: ${{ secrets.SAUCE_ACCESS_KEY }}
+  SAUCE_USERNAME: ${{ secrets.SAUCE_USERNAME }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci
+        env:
+          HUSKY: 0
+
+      - name: Lint
+        run: npm run lint
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Install Dependencies
+        run: npm ci --production
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: 0
+          HUSKY: 0
+
+      - name: Build Project
+        run: npm run build
+
+      - name: Install Webkit Dependencies
+        run: npx playwright install-deps webkit
+
+      - name: Integration Tests
+        env:
+          SAUCE_CYPRESS_VIDEO_RECORDING: false
+        run: npm run test
+
+  build-windows-bundle:
+    runs-on: windows-latest
+    needs: [lint, integration]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Google Cloud Login
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCS_RUNNER_SA_KEY }}'
+
+      - name: Install gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCS_RUNNER_PROJECT_ID }}
+        env:
+          CLOUDSDK_PYTHON: ${{env.pythonLocation}}\python.exe
+
+      - name: Update Release Version
+        run: npm version --no-git-tag-version 1.0.0
+
+      - name: Bundle Directory
+        run: bash ./scripts/bundle.windows.sh
+
+      - name: Get Cypress Version
+        run: |
+          Write-Output "cypress_version=$((Get-Content ./package.json -Raw | ConvertFrom-Json).dependencies.cypress)" >> $env:GITHUB_ENV
+
+      - name: Upload to GCS
+        run: |
+          gsutil cp ./cypress-windows-amd64.zip gs://${{ secrets.GCS_RUNNER_BUCKET }}/cypress-windows-amd64-${{ github.run_id }}.zip
+
+  build-mac-bundle:
+    # macos-15-intel for amd64 builds
+    runs-on: macos-15-intel
+    needs: [lint, integration]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: ".nvmrc"
+          cache: "npm"
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Google Cloud Login
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: '${{ secrets.GCS_RUNNER_SA_KEY }}'
+
+      - name: Install gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ secrets.GCS_RUNNER_PROJECT_ID }}
+        env:
+          CLOUDSDK_PYTHON: ${{env.pythonLocation}}/python
+
+      - name: Update Release Version
+        run: npm version --no-git-tag-version 1.0.0
+
+      - name: Bundle Directory
+        run: bash ./scripts/bundle.macos.sh
+
+      - name: Get Cypress Version
+        run: |
+          CYPRESS_VERSION=$(< package-lock.json jq -r '.dependencies["cypress"].version')
+          echo "cypress_version=$CYPRESS_VERSION" >> $GITHUB_ENV
+
+      - name: Upload to GCS
+        run: |
+          gsutil cp ./cypress-macos-amd64.zip gs://${{ secrets.GCS_RUNNER_BUCKET }}/cypress-macos-amd64-${{ github.run_id }}.zip
+
+  bundle-test:
+    needs: [build-windows-bundle, build-mac-bundle]
+    strategy:
+      max-parallel: 3
+      fail-fast: false
+      matrix:
+        os: [Win10, Win11, macOS11, macOS12, macOS13]
+        browser: [Chrome, Firefox, Webkit]
+        exclude:
+          - os: Win10
+            browser: Webkit
+          - os: Win11
+            browser: Webkit
+          - os: macOS11
+            browser: Webkit
+          - os: macOS12
+            browser: Webkit
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup saucectl
+        uses: saucelabs/saucectl-run-action@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          skip-run: true
+
+      - name: Test on Sauce
+        working-directory: ./tests/cloud/
+        run: |
+          BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-windows-amd64-${{ github.run_id }}.zip
+          if [[ ${{ matrix.os }} =~ ^mac ]];then
+            BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-macos-amd64-${{ github.run_id }}.zip
+          fi
+
+          saucectl run \
+            --runner-version "url: ${BUNDLE_URL}" \
+            --config ./.sauce/config.yml \
+            --select-suite "Cypress - ${{ matrix.os }} - ${{ matrix.browser }}"
+
+  bundle-tests-with-sc:
+    needs: [build-windows-bundle, build-mac-bundle]
+    strategy:
+      max-parallel: 3
+      fail-fast: false
+      matrix:
+        os: [Win10, Win11, macOS11, macOS12, macOS13]
+        browser: [Chrome, Firefox, Webkit]
+        exclude:
+          - os: Win10
+            browser: Webkit
+          - os: Win11
+            browser: Webkit
+          - os: macOS11
+            browser: Webkit
+          - os: macOS12
+            browser: Webkit
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout runner
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup saucectl
+        uses: saucelabs/saucectl-run-action@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          skip-run: true
+
+      - name: Run web-page
+        run: |
+          python -m http.server 8000 &
+        working-directory: ./tests/cloud/www/
+
+      - name: Start sauce-connect
+        uses: saucelabs/sauce-connect-action@v2
+        with:
+          username: ${{ secrets.SAUCE_USERNAME }}
+          accessKey: ${{ secrets.SAUCE_ACCESS_KEY }}
+          tunnelIdentifier: github-cypress-sc-check-tunnel-${{ matrix.os }}-${{ matrix.browser }}
+
+      - name: Test on Sauce (+ Sauce-Connect)
+        working-directory: ./tests/cloud/
+        run: |
+          BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-windows-amd64-${{ github.run_id }}.zip
+          if [[ ${{ matrix.os }} =~ ^mac ]];then
+            BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-macos-amd64-${{ github.run_id }}.zip
+          fi
+
+          saucectl run \
+            --runner-version "url: ${BUNDLE_URL}" \
+            --config ./.sauce/config-sc.yml \
+            --select-suite "Cypress - ${{ matrix.os }} - ${{ matrix.browser }}" \
+            --tunnel-name github-cypress-sc-check-tunnel-${{ matrix.os }}-${{ matrix.browser }}
+
+  bundle-test-modules:
+    needs: [build-windows-bundle, build-mac-bundle]
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        os: [Win10, MacOS]
+        type: [cjs, esm]
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup saucectl
+        uses: saucelabs/saucectl-run-action@v4
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          skip-run: true
+
+      - name: Test on Sauce
+        working-directory: ./tests/integration/${{ matrix.type }}-project/
+        run: |
+          BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-windows-amd64-${{ github.run_id }}.zip
+          if [[ ${{ matrix.os }} = MacOS ]];then
+            BUNDLE_URL=https://storage.googleapis.com/${{ secrets.GCS_RUNNER_BUCKET }}/cypress-macos-amd64-${{ github.run_id }}.zip
+          fi
+
+          saucectl run \
+            --runner-version "url: ${BUNDLE_URL}" \
+            --config ./.sauce/config.yml \
+            --select-suite "Cypress - ${{ matrix.os }} - Chrome"
