@@ -1,3 +1,2 @@
-npx prettier --write '**/*.{js,ts,mjs,cjs}'   
-git add -u   
-npm run lint                                 
+npx pretty-quick --staged --pattern "**/*.{js,ts,mjs,cjs}"
+npm run lint
