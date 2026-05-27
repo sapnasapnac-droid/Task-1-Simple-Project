@@ -102,10 +102,11 @@ jobs:
                 # ----- Update-decision helpers -----
                 identify_major_bumps() {
                     jq -r --slurpfile orig /tmp/pkg.orig '
-                        ($orig[0].dependencies // {}) + ($orig[0].devDependencies // {}) as $o |
-                        (.dependencies // {}) + (.devDependencies // {}) as $n |
+                        (($orig[0].dependencies // {}) + ($orig[0].devDependencies // {})) as $o |
+                        ((.dependencies // {}) + (.devDependencies // {})) as $n |
                         [ $n | to_entries[] |
                           select($o[.key] != null) |
+                          select((.value | type) == "string" and ($o[.key] | type) == "string") |
                           select(
                               ((.value   | sub("[~^]";"") | split(".")[0])) !=
                               (($o[.key] | sub("[~^]";"") | split(".")[0]))
@@ -161,8 +162,12 @@ jobs:
 
                     if [ -z "$BISECT_SCOPE" ] && [ -z "$BISECT_TRIED" ]; then
                         # First failure of this round — start fresh bisection
-                        local majors=$(identify_major_bumps)
-                        local actionable=$(filter_new "$majors")
+                        local majors actionable
+                        majors=$(identify_major_bumps) || {
+                            echo "::error::identify_major_bumps failed — see jq output above"
+                            return 1
+                        }
+                        actionable=$(filter_new "$majors")
                         if [ -z "$actionable" ]; then
                             echo "::error::$phase_name failed; no major bumps left to bisect"
                             return 1
