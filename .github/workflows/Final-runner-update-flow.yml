@@ -1,6 +1,16 @@
 name: Robust Dependency Update Flow
 on:
     workflow_dispatch:
+        inputs:
+            update_level:
+                description: 'How far to update'
+                required: true
+                default: 'minor'
+                type: choice
+                options:
+                    - patch
+                    - minor
+                    - latest
 
 jobs:
     update:
@@ -24,98 +34,216 @@ jobs:
                 node-version: '20'
                 cache: 'npm'
 
-            - name: Install dependencies
+            - name: Install dependencies (baseline)
               run: |
                 set -o pipefail
                 npm ci 2>&1 | tee /tmp/install.log
-            
-            - name: Update dependencies
+
+            - name: Update, build, and test with self-healing rejection
               id: update
               run: |
                 set -o pipefail
                 npm install -g npm-check-updates
 
+                TARGET="${{ inputs.update_level }}"
+                PERMANENT_REJECT="typescript"   # add others as needed, comma-separated
+                MAX_ATTEMPTS=20
+
                 cp package.json /tmp/pkg.orig
                 cp package-lock.json /tmp/lock.orig
 
+                # ---------- Probe: capture what every package COULD be bumped to ----------
+                cp /tmp/pkg.orig /tmp/probe.json
+                PROBE=$(ncu --packageFile /tmp/probe.json --target "$TARGET" --jsonUpgraded 2>/dev/null || echo '{}')
+                # Guard against malformed probe output
+                if ! echo "$PROBE" | jq empty >/dev/null 2>&1; then
+                    PROBE='{}'
+                fi
+                echo "Probe found $(echo "$PROBE" | jq 'length') packages with available updates"
+
                 OUR_DEPS=$(jq -r '.dependencies, .devDependencies | keys[]' package.json | sort -u)
+                HAS_BUILD=$(npm pkg get scripts.build | grep -cv '^{}$' || true)
+                HAS_TEST=$(npm pkg get scripts.test  | grep -cv '^{}$' || true)
 
                 REJECT_LIST=""
-                MAX_ATTEMPTS=20
+                TEST_OUTCOME="skipped"
+                LOOP_RESULT=""
 
+                # ---------- Helpers ----------
+                make_reject_arg() {
+                    local combined="$PERMANENT_REJECT"
+                    if [ -n "$REJECT_LIST" ]; then
+                        combined="${combined:+$combined,}$REJECT_LIST"
+                    fi
+                    echo "$combined"
+                }
+
+                identify_major_bumps() {
+                    # Diff /tmp/pkg.orig vs current package.json — return comma list of packages
+                    # whose major version number changed.
+                    jq -r --slurpfile orig /tmp/pkg.orig '
+                        ($orig[0].dependencies // {}) + ($orig[0].devDependencies // {}) as $o |
+                        (.dependencies // {}) + (.devDependencies // {}) as $n |
+                        [ $n | to_entries[] |
+                          select($o[.key] != null) |
+                          select(
+                              ((.value   | sub("[~^]";"") | split(".")[0])) !=
+                              (($o[.key] | sub("[~^]";"") | split(".")[0]))
+                          ) | .key
+                        ] | join(",")
+                    ' package.json
+                }
+
+                filter_new_rejections() {
+                    # Drop entries already on REJECT_LIST or PERMANENT_REJECT
+                    local input="$1"
+                    local result=""
+                    local pkg
+                    IFS=',' read -ra ARR <<< "$input"
+                    for pkg in "${ARR[@]}"; do
+                        [ -z "$pkg" ] && continue
+                        if ! echo ",$REJECT_LIST,$PERMANENT_REJECT," | grep -q ",$pkg,"; then
+                            result="${result:+$result,}$pkg"
+                        fi
+                    done
+                    echo "$result"
+                }
+
+                # ---------- Self-healing loop ----------
                 for attempt in $(seq 1 $MAX_ATTEMPTS); do
                     echo ""
-                    echo "Attempt $attempt of $MAX_ATTEMPTS"
+                    echo "===== Attempt $attempt of $MAX_ATTEMPTS ====="
 
-                    rm -rf node_modules
+                    rm -rf node_modules lib dist
                     cp /tmp/pkg.orig package.json
                     cp /tmp/lock.orig package-lock.json
 
-                    if [ -z "$REJECT_LIST" ]; then
-                        echo "No dependencies to reject. Updating all dependencies."
-                        ncu -u --target latest
+                    REJECT_ARG=$(make_reject_arg)
+                    if [ -n "$REJECT_ARG" ]; then
+                        echo "Rejecting: $REJECT_ARG"
+                        ncu -u --target "$TARGET" --reject "$REJECT_ARG"
                     else
-                        echo "Updating dependencies, rejecting: $REJECT_LIST"
-                        ncu -u --target latest --reject "$REJECT_LIST"
+                        ncu -u --target "$TARGET"
                     fi
 
+                    # ----- Install -----
                     npm install 2>&1 | tee /tmp/install.log
-                    INSTALL_EXIT_CODE=${PIPESTATUS[0]}
+                    INSTALL_EXIT=${PIPESTATUS[0]}
 
-                    if [ $INSTALL_EXIT_CODE -eq 0 ]; then
-                        echo "✅ Install succeeded on attempt $attempt"
-                        echo "rejected=$REJECT_LIST" >> $GITHUB_OUTPUT
-                        echo "attempts=$attempt" >> $GITHUB_OUTPUT
-                        exit 0
-                    fi
+                    if [ $INSTALL_EXIT -ne 0 ]; then
+                        if grep -qE "ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN" /tmp/install.log; then
+                            echo "::warning::Network issue, retrying in 10s"
+                            sleep 10
+                            continue
+                        fi
+                        if ! grep -q "ERESOLVE" /tmp/install.log; then
+                            echo "::error::Non-ERESOLVE install failure"
+                            cat /tmp/install.log
+                            exit 1
+                        fi
 
-                    if grep -qE "ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN" /tmp/install.log; then
-                        echo "::warning::Network issue detected, retrying same install in 10s"
-                        sleep 10
+                        CANDIDATES=$( {
+                            grep -oP "Conflicting peer dependency: \K[@a-z0-9/-]+" /tmp/install.log
+                            grep -oP "peer \K[@a-z0-9/-]+(?=@)" /tmp/install.log
+                            grep -oP "Found: \K[@a-z0-9/-]+(?=@)" /tmp/install.log
+                        } | sort -u | tr '\n' ',' | sed 's/,$//')
+
+                        # Only reject things we actually own
+                        OWNED=""
+                        IFS=',' read -ra ARR <<< "$CANDIDATES"
+                        for pkg in "${ARR[@]}"; do
+                            [ -z "$pkg" ] && continue
+                            if echo "$OUR_DEPS" | grep -qx "$pkg"; then
+                                OWNED="${OWNED:+$OWNED,}$pkg"
+                            fi
+                        done
+                        NEW=$(filter_new_rejections "$OWNED")
+
+                        if [ -z "$NEW" ]; then
+                            echo "::error::ERESOLVE conflict with no actionable packages"
+                            cat /tmp/install.log
+                            exit 1
+                        fi
+                        REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
+                        echo "🔎 Reject (install conflict): $NEW"
                         continue
                     fi
 
-                    if ! grep -q "ERESOLVE" /tmp/install.log; then
-                        echo "::error::Non-ERESOLVE failure — not retriable"
-                        cat /tmp/install.log
-                        exit 1
-                    fi
-
-                    CANDIDATES=$( {
-                        grep -oP "Conflicting peer dependency: \K[@a-z0-9/-]+" /tmp/install.log
-                        grep -oP "peer \K[@a-z0-9/-]+(?=@)" /tmp/install.log
-                        grep -oP "Found: \K[@a-z0-9/-]+(?=@)" /tmp/install.log
-                    } | sort -u)
-                    
-                    NEW=""
-                    for pkg in $CANDIDATES; do
-                        if echo "$OUR_DEPS" | grep -qx "$pkg"; then
-                            if ! echo ",$REJECT_LIST," | grep -q ",$pkg,"; then
-                                NEW="$NEW,$pkg"
+                    # ----- Build -----
+                    if [ "$HAS_BUILD" -gt 0 ]; then
+                        echo "Running build..."
+                        if npm run build 2>&1 | tee /tmp/build.log; then
+                            echo "✅ Build succeeded"
+                        else
+                            MAJORS=$(identify_major_bumps)
+                            NEW=$(filter_new_rejections "$MAJORS")
+                            if [ -z "$NEW" ]; then
+                                echo "::error::Build failed and no major bumps left to reject"
+                                cat /tmp/build.log
+                                exit 1
                             fi
+                            REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
+                            echo "🔎 Reject (build failure): $NEW"
+                            continue
                         fi
-                    done
-                    NEW=$(echo "$NEW" | sed 's/^,//')
-
-                    if [ -z "$NEW" ]; then
-                        echo "::error::Conflict detected but no new actionable packages found"
-                        echo "Attempts: $attempt"
-                        echo "Reject list at exit: $REJECT_LIST"
-                        cat /tmp/install.log
-                        exit 1
                     fi
 
-                    echo "🔎 Adding to reject list: $NEW"
-                    if [ -z "$REJECT_LIST" ]; then
-                        REJECT_LIST="$NEW"
-                    else
-                        REJECT_LIST="$REJECT_LIST,$NEW"
+                    # ----- Test -----
+                    if [ "$HAS_TEST" -gt 0 ]; then
+                        echo "Running tests..."
+                        if npm test 2>&1 | tee /tmp/test.log; then
+                            echo "✅ Tests passed"
+                            TEST_OUTCOME="success"
+                        else
+                            MAJORS=$(identify_major_bumps)
+                            NEW=$(filter_new_rejections "$MAJORS")
+                            if [ -n "$NEW" ]; then
+                                REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
+                                echo "🔎 Reject (test failure): $NEW"
+                                continue
+                            fi
+                            # Out of majors to roll back — ship PR with failing tests
+                            echo "::warning::Tests still failing after exhausting major rollbacks — shipping PR for human review"
+                            TEST_OUTCOME="failure"
+                        fi
                     fi
+
+                    LOOP_RESULT="success"
+                    break
                 done
 
-                echo "::error::Failed to resolve dependencies after $MAX_ATTEMPTS attempts"
-                echo "Final reject list: $REJECT_LIST"
-                exit 1
+                if [ "$LOOP_RESULT" != "success" ]; then
+                    echo "::error::Could not converge after $MAX_ATTEMPTS attempts"
+                    echo "Final reject list: $REJECT_LIST"
+                    exit 1
+                fi
+
+                # ---------- Build held-back report ----------
+                ALL_REJECTED="$PERMANENT_REJECT"
+                if [ -n "$REJECT_LIST" ]; then
+                    ALL_REJECTED="${ALL_REJECTED:+$ALL_REJECTED,}$REJECT_LIST"
+                fi
+
+                REJECT_DETAILS=$(jq -r -n \
+                    --slurpfile orig /tmp/pkg.orig \
+                    --argjson probe "$PROBE" \
+                    --arg list "$ALL_REJECTED" '
+                    (($orig[0].dependencies // {}) + ($orig[0].devDependencies // {})) as $old |
+                    ($list | split(",") | map(select(. != ""))) as $rejected |
+                    $rejected[] |
+                    select($probe[.] != null and $old[.] != null) |
+                    "- **\(.)**: `\($old[.])` → `\($probe[.])`"
+                ')
+
+                {
+                    echo "attempts=$attempt"
+                    echo "test_outcome=$TEST_OUTCOME"
+                    echo "rejected=$REJECT_LIST"
+                    echo "permanent_rejected=$PERMANENT_REJECT"
+                    echo "reject_details<<EOF"
+                    echo "$REJECT_DETAILS"
+                    echo "EOF"
+                } >> $GITHUB_OUTPUT
 
             - name: Check for changes
               id: changed
@@ -128,54 +256,32 @@ jobs:
                     echo "Changes detected — will create PR"
                 fi
 
-            - name: Build the project
-              if: steps.changed.outputs.had_changes == 'true'
-              run: |
-                if [ -n "$(npm pkg get scripts.build | grep -v '^{}$')" ]; then
-                    echo "Running build..."
-                    npm run build
-                    echo "Build complete. Verifying output..."
-                    ls -la lib/ || echo "::warning::lib/ directory was not created"
-                else
-                    echo "::notice::No build script defined — skipping build"
-                fi
-
-            - name: Run tests on updated dependencies
-              id: test
-              if: steps.changed.outputs.had_changes == 'true'
-              continue-on-error: true
-              run: |
-                if [ -n "$(npm pkg get scripts.test | grep -v '^{}$')" ]; then
-                    npm test
-                else
-                    echo "::notice::No test script defined — skipping test verification"
-                    exit 0
-                fi
-
             - name: Create Pull Request
               if: steps.changed.outputs.had_changes == 'true'
               uses: peter-evans/create-pull-request@v7
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
-                commit-message: "chore: dependency update"
+                commit-message: "chore: dependency update (${{ inputs.update_level }})"
                 title: |
-                  ${{ steps.test.outcome == 'failure' && '⚠️ [TESTS FAILING] Dependency update' || 'chore: Dependency update' }}
+                  ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ [TESTS FAILING] ' || '' }}chore: Dependency update (${{ inputs.update_level }})
                 labels: |
-                  ${{ steps.test.outcome == 'failure' && 'dependencies,needs-review,tests-failing' || 'dependencies,automated' }}
+                  ${{ steps.update.outputs.test_outcome == 'failure' && 'dependencies,needs-review,tests-failing' || 'dependencies,automated' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}
                 body: |
                     Automatic dependency update via self-healing workflow.
 
                     ## Update Summary
-                    - **Attempts to resolve conflicts:** ${{ steps.update.outputs.attempts }}
-                    - **Auto-rejected packages:** `${{ steps.update.outputs.rejected || 'none — all updates clean' }}`
-                    - **Test result:** ${{ steps.test.outcome }}
+                    - **Update level:** `${{ inputs.update_level }}`
+                    - **Attempts to converge:** ${{ steps.update.outputs.attempts }}
+                    - **Test result:** ${{ steps.update.outputs.test_outcome }}
+
+                    ## Held back from this run
+
+                    ${{ steps.update.outputs.reject_details || '_All available updates applied cleanly — nothing held back._' }}
 
                     ## Review Guidance
-                    ${{ steps.test.outcome == 'failure' && '⚠️ **Tests failed.** Investigate before merging.' || '✅ Tests passed.' }}
-                    ${{ steps.update.outputs.rejected != '' && format('⚠️ **Auto-rejected packages had peer-dependency conflicts.** They may need a coordinated manual update.') || '' }}
+                    ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ **Tests failed even after rolling back available major bumps.** This may be a real regression — investigate before merging.' || '✅ Tests passed.' }}
+                    ${{ steps.update.outputs.reject_details != '' && '⚠️ Held-back packages above need a coordinated manual update — read each migration guide before bumping.' || '' }}
 
                     Generated by run #${{ github.run_number }}.
-                branch: chore/deps-${{ github.run_id }}
+                branch: chore/deps-${{ inputs.update_level }}-${{ github.run_id }}
                 delete-branch: true
-
-
