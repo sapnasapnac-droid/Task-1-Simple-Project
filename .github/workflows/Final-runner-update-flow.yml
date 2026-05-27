@@ -203,11 +203,6 @@ jobs:
                     fi
 
                     # ----- Install -----
-                    # Delete the lockfile so npm has no choice but to regenerate it
-                    # from the current (post-ncu) package.json. Without this, npm
-                    # sometimes decides the existing lockfile is "good enough" even
-                    # when package.json has been bumped.
-                    rm -f package-lock.json
                     npm install 2>&1 | tee /tmp/install.log
                     INSTALL_EXIT=${PIPESTATUS[0]}
 
@@ -248,6 +243,11 @@ jobs:
                         echo "🔎 Reject (install conflict): $NEW"
                         continue
                     fi
+
+                    # Force the lockfile to reflect the current package.json. Some npm
+                    # versions / project configs leave the lockfile untouched even when
+                    # package.json was bumped; --package-lock-only rewrites it explicitly.
+                    npm install --package-lock-only --no-audit 2>&1 | tee -a /tmp/install.log
 
                     # Snapshot the post-install state RIGHT NOW, before build/test
                     # can stomp on the lockfile (e.g. sauce-runner-utils prepareNpmEnv).
