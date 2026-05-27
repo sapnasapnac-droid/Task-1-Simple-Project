@@ -194,14 +194,20 @@ jobs:
                     cp /tmp/lock.orig package-lock.json
 
                     build_reject_list
-                    if [ -n "$REJECT_LIST" ]; then
+                    if [ -z "$REJECT_LIST" ]; then
+                        echo "Rejecting: (nothing)"
+                        ncu -u --target "$TARGET"
+                    else
                         echo "Rejecting: $REJECT_LIST"
                         ncu -u --target "$TARGET" --reject "$REJECT_LIST"
-                    else
-                        ncu -u --target "$TARGET"
                     fi
 
                     # ----- Install -----
+                    # Delete the lockfile so npm has no choice but to regenerate it
+                    # from the current (post-ncu) package.json. Without this, npm
+                    # sometimes decides the existing lockfile is "good enough" even
+                    # when package.json has been bumped.
+                    rm -f package-lock.json
                     npm install 2>&1 | tee /tmp/install.log
                     INSTALL_EXIT=${PIPESTATUS[0]}
 
@@ -360,55 +366,12 @@ jobs:
                     echo "Changes detected — will create PR"
                 fi
 
-            - name: DEBUG — pinpoint lockfile state
-              if: always()
-              run: |
-                echo "=== Snapshot files in /tmp ==="
-                ls -la /tmp/pkg.orig /tmp/lock.orig /tmp/winning-pkg.json /tmp/winning-lock.json /tmp/lock.last-good 2>&1
-
-                echo ""
-                echo "=== Did npm install actually change the lockfile? ==="
-                if diff -q /tmp/lock.orig /tmp/winning-lock.json >/dev/null 2>&1; then
-                    echo "❌ IDENTICAL — npm install did NOT change package-lock.json"
-                else
-                    echo "✅ DIFFER — npm install did change package-lock.json"
-                    echo "    lock.orig size:        $(wc -c < /tmp/lock.orig)"
-                    echo "    winning-lock.json size: $(wc -c < /tmp/winning-lock.json)"
-                fi
-
-                echo ""
-                echo "=== Working tree vs /tmp/winning-lock.json ==="
-                if diff -q package-lock.json /tmp/winning-lock.json >/dev/null 2>&1; then
-                    echo "✅ MATCH — restore worked, working tree has the winning lockfile"
-                else
-                    echo "❌ DIFFER — restore did NOT apply, working tree has different lockfile"
-                fi
-
-                echo ""
-                echo "=== Working tree vs main ==="
-                if diff -q package-lock.json /tmp/lock.orig >/dev/null 2>&1; then
-                    echo "❌ IDENTICAL to main — git will see no change → peter-evans won't commit it"
-                else
-                    echo "✅ DIFFERS from main — git will see a change"
-                fi
-
-                echo ""
-                echo "=== Git status ==="
-                git status
-
-                echo ""
-                echo "=== Git diff --stat ==="
-                git diff --stat
-
             - name: Create Pull Request
               if: steps.changed.outputs.had_changes == 'true'
               uses: peter-evans/create-pull-request@v7
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
                 commit-message: "chore: dependency update (${{ inputs.update_level }})"
-                add-paths: |
-                  package.json
-                  package-lock.json
                 title: |
                   ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ [TESTS FAILING] ' || '' }}chore: Dependency update (${{ inputs.update_level }})
                 labels: |
