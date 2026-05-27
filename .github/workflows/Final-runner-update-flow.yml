@@ -339,6 +339,9 @@ jobs:
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
                 commit-message: "chore: dependency update (${{ inputs.update_level }})"
+                add-paths: |
+                  package.json
+                  package-lock.json
                 title: |
                   ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ [TESTS FAILING] ' || '' }}chore: Dependency update (${{ inputs.update_level }})
                 labels: |
