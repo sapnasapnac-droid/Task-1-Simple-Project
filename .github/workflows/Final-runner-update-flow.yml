@@ -243,6 +243,16 @@ jobs:
                         continue
                     fi
 
+                    # Snapshot the post-install state RIGHT NOW, before build/test
+                    # can stomp on the lockfile (e.g. sauce-runner-utils prepareNpmEnv).
+                    cp package.json     /tmp/winning-pkg.json
+                    cp package-lock.json /tmp/winning-lock.json
+
+                    # Snapshot the post-install lockfile BEFORE build/test get a chance
+                    # to overwrite it. (Some test runners — e.g. sauce-testrunner-utils'
+                    # prepareNpmEnv — rewrite package-lock.json during execution.)
+                    cp package-lock.json /tmp/lock.last-good
+
                     # ----- Build -----
                     if [ "$HAS_BUILD" -gt 0 ]; then
                         echo "Running build..."
@@ -298,6 +308,23 @@ jobs:
                     exit 1
                 fi
 
+                # ===== Restore post-install snapshot =====
+                # Build/test (especially sauce-runner-utils prepareNpmEnv) can rewrite
+                # package-lock.json during the test phase. The snapshot taken right
+                # after the winning npm install is the state we actually want to commit.
+                if [ -f /tmp/winning-pkg.json ] && [ -f /tmp/winning-lock.json ]; then
+                    cp /tmp/winning-pkg.json  package.json
+                    cp /tmp/winning-lock.json package-lock.json
+                    echo "✅ Restored post-install snapshot of package.json + package-lock.json"
+                fi
+
+                # Restore the lockfile to its post-install state, undoing any rewrites
+                # the test runner may have done during npm test execution.
+                if [ -f /tmp/lock.last-good ]; then
+                    cp /tmp/lock.last-good package-lock.json
+                    echo "Restored package-lock.json to post-install snapshot"
+                fi
+
                 # ===================== Held-back report =====================
                 build_reject_list
                 REJECT_DETAILS=$(jq -r -n \
@@ -339,9 +366,6 @@ jobs:
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
                 commit-message: "chore: dependency update (${{ inputs.update_level }})"
-                add-paths: |
-                  package.json
-                  package-lock.json
                 title: |
                   ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ [TESTS FAILING] ' || '' }}chore: Dependency update (${{ inputs.update_level }})
                 labels: |
