@@ -53,10 +53,10 @@ jobs:
 
                     if [ -z "$REJECT_LIST" ]; then
                         echo "No dependencies to reject. Updating all dependencies."
-                        ncu -u --target minor
+                        ncu -u --target latest
                     else
                         echo "Updating dependencies, rejecting: $REJECT_LIST"
-                        ncu -u --target minor --reject "$REJECT_LIST"
+                        ncu -u --target latest --reject "$REJECT_LIST"
                     fi
 
                     npm install 2>&1 | tee /tmp/install.log
