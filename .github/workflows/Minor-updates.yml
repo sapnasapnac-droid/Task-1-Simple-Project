@@ -1,4 +1,4 @@
-name: Robust Dependency Update Flow
+name: Robust Dependency Update Flow (Minor Versions)
 on:
     workflow_dispatch:
 
