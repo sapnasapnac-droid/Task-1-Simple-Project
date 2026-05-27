@@ -39,21 +39,23 @@ jobs:
                 set -o pipefail
                 npm ci 2>&1 | tee /tmp/install.log
 
-            - name: Update, build, and test with bisecting self-healing rejection
+            - name: Update, build, and test with self-healing rejection
               id: update
               run: |
                 set -o pipefail
                 npm install -g npm-check-updates
 
                 TARGET="${{ inputs.update_level }}"
-                MAX_ATTEMPTS=25
+                PERMANENT_REJECT="typescript"   # add others as needed, comma-separated
+                MAX_ATTEMPTS=20
 
                 cp package.json /tmp/pkg.orig
                 cp package-lock.json /tmp/lock.orig
 
-                # Probe: capture what every package COULD be bumped to (for held-back report)
+                # ---------- Probe: capture what every package COULD be bumped to ----------
                 cp /tmp/pkg.orig /tmp/probe.json
                 PROBE=$(ncu --packageFile /tmp/probe.json --target "$TARGET" --jsonUpgraded 2>/dev/null || echo '{}')
+                # Guard against malformed probe output
                 if ! echo "$PROBE" | jq empty >/dev/null 2>&1; then
                     PROBE='{}'
                 fi
@@ -63,50 +65,27 @@ jobs:
                 HAS_BUILD=$(npm pkg get scripts.build | grep -cv '^{}$' || true)
                 HAS_TEST=$(npm pkg get scripts.test  | grep -cv '^{}$' || true)
 
-                # ----- State -----
-                REJECT_FROM_CONFLICTS=""   # packages rejected because of ERESOLVE
-                CULPRITS=""                # bisection-confirmed bad packages
-                BISECT_SCOPE=""            # current narrowing window
-                BISECT_TRIED=""            # what we rejected as a bisection trial last attempt
-                LAST_OUTCOME=""            # "pass" | "fail" — set by build/test
-                REJECT_LIST=""             # union of the three sources above; rebuilt each iteration
+                REJECT_LIST=""
                 TEST_OUTCOME="skipped"
                 LOOP_RESULT=""
 
-                # ----- CSV helpers -----
-                count_csv() {
-                    [ -z "$1" ] && echo 0 && return
-                    echo "$1" | tr ',' '\n' | grep -cv '^$'
-                }
-                csv_subtract() {
-                    comm -23 <(echo "$1" | tr ',' '\n' | sort -u) <(echo "$2" | tr ',' '\n' | sort -u) | paste -sd ','
-                }
-                csv_first_half() {
-                    local total=$(count_csv "$1")
-                    local mid=$(( total / 2 ))
-                    [ "$mid" -lt 1 ] && mid=1
-                    echo "$1" | tr ',' '\n' | head -n "$mid" | paste -sd ','
-                }
-                csv_contains() {
-                    echo ",$1," | grep -q ",$2,"
+                # ---------- Helpers ----------
+                make_reject_arg() {
+                    local combined="$PERMANENT_REJECT"
+                    if [ -n "$REJECT_LIST" ]; then
+                        combined="${combined:+$combined,}$REJECT_LIST"
+                    fi
+                    echo "$combined"
                 }
 
-                build_reject_list() {
-                    local list=""
-                    [ -n "$REJECT_FROM_CONFLICTS" ] && list="$REJECT_FROM_CONFLICTS"
-                    [ -n "$CULPRITS" ]             && list="${list:+$list,}$CULPRITS"
-                    [ -n "$BISECT_TRIED" ]         && list="${list:+$list,}$BISECT_TRIED"
-                    REJECT_LIST="$list"
-                }
-
-                # ----- Update-decision helpers -----
                 identify_major_bumps() {
+                    # Diff /tmp/pkg.orig vs current package.json — return comma list of packages
+                    # whose major version number changed.
                     jq -r --slurpfile orig /tmp/pkg.orig '
-                        (($orig[0].dependencies // {}) + ($orig[0].devDependencies // {})) as $o |
-                        ((.dependencies // {}) + (.devDependencies // {})) as $n |
+                        ($orig[0].dependencies // {}) + ($orig[0].devDependencies // {}) as $o |
+                        (.dependencies // {}) + (.devDependencies // {}) as $n |
                         [ $n | to_entries[] |
                           select($o[.key] != null) |
-                          select((.value | type) == "string" and ($o[.key] | type) == "string") |
                           select(
                               ((.value   | sub("[~^]";"") | split(".")[0])) !=
                               (($o[.key] | sub("[~^]";"") | split(".")[0]))
@@ -115,76 +94,22 @@ jobs:
                     ' package.json
                 }
 
-                filter_new() {
-                    # Drop items already in REJECT_LIST
-                    build_reject_list
+                filter_new_rejections() {
+                    # Drop entries already on REJECT_LIST or PERMANENT_REJECT
                     local input="$1"
                     local result=""
                     local pkg
                     IFS=',' read -ra ARR <<< "$input"
                     for pkg in "${ARR[@]}"; do
                         [ -z "$pkg" ] && continue
-                        if ! csv_contains "$REJECT_LIST" "$pkg"; then
+                        if ! echo ",$REJECT_LIST,$PERMANENT_REJECT," | grep -q ",$pkg,"; then
                             result="${result:+$result,}$pkg"
                         fi
                     done
                     echo "$result"
                 }
 
-                # ----- Bisection control -----
-                advance_bisection() {
-                    # If last attempt PASSED while bisecting, the culprit is in BISECT_TRIED
-                    if [ -n "$BISECT_TRIED" ] && [ "$LAST_OUTCOME" = "pass" ]; then
-                        BISECT_SCOPE="$BISECT_TRIED"
-                        echo "🔬 Narrowing (pass): culprit IS in [$BISECT_TRIED]; scope -> [$BISECT_SCOPE]"
-                    fi
-                    BISECT_TRIED=""
-
-                    local size=$(count_csv "$BISECT_SCOPE")
-                    if [ "$size" -le 1 ] && [ -n "$BISECT_SCOPE" ]; then
-                        CULPRITS="${CULPRITS:+$CULPRITS,}$BISECT_SCOPE"
-                        echo "✅ Confirmed culprit: $BISECT_SCOPE"
-                        BISECT_SCOPE=""
-                        return
-                    fi
-                    if [ "$size" -eq 0 ]; then
-                        return
-                    fi
-
-                    local first_half=$(csv_first_half "$BISECT_SCOPE")
-                    BISECT_TRIED="$first_half"
-                    echo "🔬 Bisect step: reject [$first_half] | active [$(csv_subtract "$BISECT_SCOPE" "$first_half")]"
-                }
-
-                plan_failure_step() {
-                    # Returns 0 to retry, 1 to give up.
-                    local phase_name="$1"
-
-                    if [ -z "$BISECT_SCOPE" ] && [ -z "$BISECT_TRIED" ]; then
-                        # First failure of this round — start fresh bisection
-                        local majors actionable
-                        majors=$(identify_major_bumps) || {
-                            echo "::error::identify_major_bumps failed — see jq output above"
-                            return 1
-                        }
-                        actionable=$(filter_new "$majors")
-                        if [ -z "$actionable" ]; then
-                            echo "::error::$phase_name failed; no major bumps left to bisect"
-                            return 1
-                        fi
-                        BISECT_SCOPE="$actionable"
-                        echo "🔬 Starting bisection on: $BISECT_SCOPE"
-                    elif [ -n "$BISECT_TRIED" ]; then
-                        # Failure while bisecting — culprit is NOT (only) in BISECT_TRIED
-                        BISECT_SCOPE=$(csv_subtract "$BISECT_SCOPE" "$BISECT_TRIED")
-                        echo "🔬 Narrowing (fail): culprit not in [$BISECT_TRIED]; scope -> [$BISECT_SCOPE]"
-                    fi
-
-                    advance_bisection
-                    return 0
-                }
-
-                # ===================== Main loop =====================
+                # ---------- Self-healing loop ----------
                 for attempt in $(seq 1 $MAX_ATTEMPTS); do
                     echo ""
                     echo "===== Attempt $attempt of $MAX_ATTEMPTS ====="
@@ -193,13 +118,12 @@ jobs:
                     cp /tmp/pkg.orig package.json
                     cp /tmp/lock.orig package-lock.json
 
-                    build_reject_list
-                    if [ -z "$REJECT_LIST" ]; then
-                        echo "Rejecting: (nothing)"
-                        ncu -u --target "$TARGET"
+                    REJECT_ARG=$(make_reject_arg)
+                    if [ -n "$REJECT_ARG" ]; then
+                        echo "Rejecting: $REJECT_ARG"
+                        ncu -u --target "$TARGET" --reject "$REJECT_ARG"
                     else
-                        echo "Rejecting: $REJECT_LIST"
-                        ncu -u --target "$TARGET" --reject "$REJECT_LIST"
+                        ncu -u --target "$TARGET"
                     fi
 
                     # ----- Install -----
@@ -224,6 +148,7 @@ jobs:
                             grep -oP "Found: \K[@a-z0-9/-]+(?=@)" /tmp/install.log
                         } | sort -u | tr '\n' ',' | sed 's/,$//')
 
+                        # Only reject things we actually own
                         OWNED=""
                         IFS=',' read -ra ARR <<< "$CANDIDATES"
                         for pkg in "${ARR[@]}"; do
@@ -232,45 +157,33 @@ jobs:
                                 OWNED="${OWNED:+$OWNED,}$pkg"
                             fi
                         done
-                        NEW=$(filter_new "$OWNED")
+                        NEW=$(filter_new_rejections "$OWNED")
 
                         if [ -z "$NEW" ]; then
                             echo "::error::ERESOLVE conflict with no actionable packages"
                             cat /tmp/install.log
                             exit 1
                         fi
-                        REJECT_FROM_CONFLICTS="${REJECT_FROM_CONFLICTS:+$REJECT_FROM_CONFLICTS,}$NEW"
+                        REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
                         echo "🔎 Reject (install conflict): $NEW"
                         continue
                     fi
-
-                    # Force the lockfile to reflect the current package.json. Some npm
-                    # versions / project configs leave the lockfile untouched even when
-                    # package.json was bumped; --package-lock-only rewrites it explicitly.
-                    npm install --package-lock-only --no-audit 2>&1 | tee -a /tmp/install.log
-
-                    # Snapshot the post-install state RIGHT NOW, before build/test
-                    # can stomp on the lockfile (e.g. sauce-runner-utils prepareNpmEnv).
-                    cp package.json     /tmp/winning-pkg.json
-                    cp package-lock.json /tmp/winning-lock.json
-
-                    # Snapshot the post-install lockfile BEFORE build/test get a chance
-                    # to overwrite it. (Some test runners — e.g. sauce-testrunner-utils'
-                    # prepareNpmEnv — rewrite package-lock.json during execution.)
-                    cp package-lock.json /tmp/lock.last-good
 
                     # ----- Build -----
                     if [ "$HAS_BUILD" -gt 0 ]; then
                         echo "Running build..."
                         if npm run build 2>&1 | tee /tmp/build.log; then
                             echo "✅ Build succeeded"
-                            LAST_OUTCOME="pass"
                         else
-                            LAST_OUTCOME="fail"
-                            if ! plan_failure_step "Build"; then
+                            MAJORS=$(identify_major_bumps)
+                            NEW=$(filter_new_rejections "$MAJORS")
+                            if [ -z "$NEW" ]; then
+                                echo "::error::Build failed and no major bumps left to reject"
                                 cat /tmp/build.log
                                 exit 1
                             fi
+                            REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
+                            echo "🔎 Reject (build failure): $NEW"
                             continue
                         fi
                     fi
@@ -280,63 +193,41 @@ jobs:
                         echo "Running tests..."
                         if npm test 2>&1 | tee /tmp/test.log; then
                             echo "✅ Tests passed"
-                            LAST_OUTCOME="pass"
+                            TEST_OUTCOME="success"
                         else
-                            LAST_OUTCOME="fail"
-                            if plan_failure_step "Test"; then
+                            MAJORS=$(identify_major_bumps)
+                            NEW=$(filter_new_rejections "$MAJORS")
+                            if [ -n "$NEW" ]; then
+                                REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$NEW"
+                                echo "🔎 Reject (test failure): $NEW"
                                 continue
-                            else
-                                echo "::warning::Tests still failing — shipping PR for human review"
-                                TEST_OUTCOME="failure"
                             fi
+                            # Out of majors to roll back — ship PR with failing tests
+                            echo "::warning::Tests still failing after exhausting major rollbacks — shipping PR for human review"
+                            TEST_OUTCOME="failure"
                         fi
-                    fi
-
-                    # If a successful attempt completed but bisection is still narrowing, continue
-                    if [ -n "$BISECT_SCOPE" ] || [ -n "$BISECT_TRIED" ]; then
-                        advance_bisection
-                        continue
-                    fi
-
-                    # Finalize TEST_OUTCOME on the last good attempt
-                    if [ "$HAS_TEST" -gt 0 ] && [ "$LAST_OUTCOME" = "pass" ]; then
-                        TEST_OUTCOME="success"
                     fi
 
                     LOOP_RESULT="success"
                     break
                 done
 
-                if [ "$LOOP_RESULT" != "success" ] && [ "$TEST_OUTCOME" != "failure" ]; then
+                if [ "$LOOP_RESULT" != "success" ]; then
                     echo "::error::Could not converge after $MAX_ATTEMPTS attempts"
-                    build_reject_list
                     echo "Final reject list: $REJECT_LIST"
                     exit 1
                 fi
 
-                # ===== Restore post-install snapshot =====
-                # Build/test (especially sauce-runner-utils prepareNpmEnv) can rewrite
-                # package-lock.json during the test phase. The snapshot taken right
-                # after the winning npm install is the state we actually want to commit.
-                if [ -f /tmp/winning-pkg.json ] && [ -f /tmp/winning-lock.json ]; then
-                    cp /tmp/winning-pkg.json  package.json
-                    cp /tmp/winning-lock.json package-lock.json
-                    echo "✅ Restored post-install snapshot of package.json + package-lock.json"
+                # ---------- Build held-back report ----------
+                ALL_REJECTED="$PERMANENT_REJECT"
+                if [ -n "$REJECT_LIST" ]; then
+                    ALL_REJECTED="${ALL_REJECTED:+$ALL_REJECTED,}$REJECT_LIST"
                 fi
 
-                # Restore the lockfile to its post-install state, undoing any rewrites
-                # the test runner may have done during npm test execution.
-                if [ -f /tmp/lock.last-good ]; then
-                    cp /tmp/lock.last-good package-lock.json
-                    echo "Restored package-lock.json to post-install snapshot"
-                fi
-
-                # ===================== Held-back report =====================
-                build_reject_list
                 REJECT_DETAILS=$(jq -r -n \
                     --slurpfile orig /tmp/pkg.orig \
                     --argjson probe "$PROBE" \
-                    --arg list "$REJECT_LIST" '
+                    --arg list "$ALL_REJECTED" '
                     (($orig[0].dependencies // {}) + ($orig[0].devDependencies // {})) as $old |
                     ($list | split(",") | map(select(. != ""))) as $rejected |
                     $rejected[] |
@@ -348,8 +239,7 @@ jobs:
                     echo "attempts=$attempt"
                     echo "test_outcome=$TEST_OUTCOME"
                     echo "rejected=$REJECT_LIST"
-                    echo "culprits=$CULPRITS"
-                    echo "conflict_rejects=$REJECT_FROM_CONFLICTS"
+                    echo "permanent_rejected=$PERMANENT_REJECT"
                     echo "reject_details<<EOF"
                     echo "$REJECT_DETAILS"
                     echo "EOF"
@@ -377,21 +267,19 @@ jobs:
                 labels: |
                   ${{ steps.update.outputs.test_outcome == 'failure' && 'dependencies,needs-review,tests-failing' || 'dependencies,automated' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}
                 body: |
-                    Automatic dependency update via self-healing workflow with bisecting culprit detection.
+                    Automatic dependency update via self-healing workflow.
 
                     ## Update Summary
                     - **Update level:** `${{ inputs.update_level }}`
                     - **Attempts to converge:** ${{ steps.update.outputs.attempts }}
                     - **Test result:** ${{ steps.update.outputs.test_outcome }}
-                    - **Bisection-confirmed culprits:** `${{ steps.update.outputs.culprits || 'none' }}`
-                    - **Install-conflict rejects:** `${{ steps.update.outputs.conflict_rejects || 'none' }}`
 
                     ## Held back from this run
 
                     ${{ steps.update.outputs.reject_details || '_All available updates applied cleanly — nothing held back._' }}
 
                     ## Review Guidance
-                    ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ **Tests failed even after bisection.** This may be a real regression — investigate before merging.' || '✅ Tests passed.' }}
+                    ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ **Tests failed even after rolling back available major bumps.** This may be a real regression — investigate before merging.' || '✅ Tests passed.' }}
                     ${{ steps.update.outputs.reject_details != '' && '⚠️ Held-back packages above need a coordinated manual update — read each migration guide before bumping.' || '' }}
 
                     Generated by run #${{ github.run_number }}.
