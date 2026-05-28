@@ -1,4 +1,4 @@
-name: Robust Dependency Update Flow (with bisection)
+name: Robust Dependency Update Flow (Option C — bisect everything)
 on:
     workflow_dispatch:
         inputs:
@@ -53,6 +53,13 @@ jobs:
                 cp package.json /tmp/pkg.orig
                 cp package-lock.json /tmp/lock.orig
 
+                # Sanity-check the baseline package.json — if this is malformed,
+                # nothing downstream can work.
+                if ! jq empty /tmp/pkg.orig 2>/dev/null; then
+                    echo "::error::Baseline package.json is not valid JSON — aborting"
+                    exit 1
+                fi
+
                 # ---------- Probe: capture every available bump up front ----------
                 cp /tmp/pkg.orig /tmp/probe.json
                 PROBE=$(ncu --packageFile /tmp/probe.json --target "$TARGET" --jsonUpgraded 2>/dev/null || echo '{}')
@@ -81,16 +88,26 @@ jobs:
                     echo "$REJECT_LIST"
                 }
 
+                # Defensive: handles non-string version values, missing keys,
+                # overrides/resolutions blocks, and unusual entries (file:, git+,
+                # workspace:, etc.) by silently skipping anything that doesn't
+                # parse as a normal semver-style version string.
                 identify_major_bumps() {
                     jq -r --slurpfile orig /tmp/pkg.orig '
-                        ($orig[0].dependencies // {}) + ($orig[0].devDependencies // {}) as $o |
-                        (.dependencies // {}) + (.devDependencies // {}) as $n |
-                        [ $n | to_entries[] |
-                          select($o[.key] != null) |
-                          select(
-                              ((.value   | sub("[~^]";"") | split(".")[0])) !=
-                              (($o[.key] | sub("[~^]";"") | split(".")[0]))
-                          ) | .key
+                        def safe_obj(x): if (x | type) == "object" then x else {} end;
+                        def major(v):
+                            if (v | type) != "string" then null
+                            else (v | sub("^[~^><= ]+";"") | split(".")[0])
+                            end;
+
+                        (safe_obj($orig[0].dependencies) + safe_obj($orig[0].devDependencies)) as $o |
+                        (safe_obj(.dependencies)         + safe_obj(.devDependencies))         as $n |
+                        [ $n | to_entries[]
+                          | select((.value | type) == "string")
+                          | select($o[.key] != null and ($o[.key] | type) == "string")
+                          | select(major(.value) != null and major($o[.key]) != null)
+                          | select(major(.value) != major($o[.key]))
+                          | .key
                         ] | join(",")
                     ' package.json
                 }
@@ -114,8 +131,8 @@ jobs:
                 # try_majors APPLY PHASE
                 # Restores baseline, applies ONLY the listed majors (holds back the rest
                 # of CURRENT_MAJORS as well as REJECT_LIST), then runs install + build
-                # (+ test if PHASE=test). Echoes "pass" or "fail". All diagnostics go
-                # to stderr so the function is safe inside $(...).
+                # (+ test if PHASE=test). Echoes "pass" or "fail". All diagnostics to
+                # stderr so the function is safe inside $(...).
                 try_majors() {
                     local apply_majors="$1"
                     local phase="$2"
@@ -143,8 +160,6 @@ jobs:
                     cp /tmp/pkg.orig package.json
                     cp /tmp/lock.orig package-lock.json
 
-                    # Reject set for this trial = accumulated REJECT_LIST +
-                    # (CURRENT_MAJORS that are NOT in apply_majors)
                     local reject_for_trial="$REJECT_LIST"
 
                     local m
@@ -180,9 +195,7 @@ jobs:
                 }
 
                 # bisect_culprits CANDIDATES PHASE [DEPTH]
-                # Parallel divide-and-conquer: tests BOTH halves in isolation at each
-                # level. Handles independent culprits in different halves correctly,
-                # caps recursion at BISECT_MAX_DEPTH, treats pass:pass as flake.
+                # Parallel divide-and-conquer fault localization.
                 bisect_culprits() {
                     local candidates="$1"
                     local phase="$2"
@@ -209,7 +222,6 @@ jobs:
                     result_a=$(try_majors "$half_a" "$phase")
                     result_b=$(try_majors "$half_b" "$phase")
 
-                    # Flake guard: both halves passing contradicts the parent failure
                     if [ "$result_a" = "pass" ] && [ "$result_b" = "pass" ]; then
                         echo "::warning::Both halves passed at depth=$depth — re-running once for flake check" >&2
                         result_a=$(try_majors "$half_a" "$phase")
@@ -228,16 +240,12 @@ jobs:
                 }
 
                 # locate_and_confirm CANDIDATES PHASE
-                # Wraps bisect_culprits with a final confirmation: re-runs with the
-                # nominated culprits held back and everything else applied. If that
-                # still fails, falls back to rejecting the full candidate set —
-                # protects against bisection being misled by interaction effects.
                 locate_and_confirm() {
                     local candidates="$1"
                     local phase="$2"
 
                     if [ "$BISECT_MAX_DEPTH" -le 0 ]; then
-                        echo "$candidates"   # bisection disabled
+                        echo "$candidates"
                         return
                     fi
 
@@ -387,15 +395,18 @@ jobs:
 
                 BISECT_TRIALS=$(cat "$TRIAL_COUNTER")
 
-                # ---------- Held-back report ----------
+                # ---------- Held-back report (also defensive) ----------
                 REJECT_DETAILS=$(jq -r -n \
                     --slurpfile orig /tmp/pkg.orig \
                     --argjson probe "$PROBE" \
                     --arg list "$REJECT_LIST" '
-                    (($orig[0].dependencies // {}) + ($orig[0].devDependencies // {})) as $old |
+                    def safe_obj(x): if (x | type) == "object" then x else {} end;
+
+                    (safe_obj($orig[0].dependencies) + safe_obj($orig[0].devDependencies)) as $old |
                     ($list | split(",") | map(select(. != ""))) as $rejected |
                     $rejected[] |
                     select($probe[.] != null and $old[.] != null) |
+                    select(($old[.] | type) == "string" and ($probe[.] | type) == "string") |
                     "- **\(.)**: `\($old[.])` → `\($probe[.])`"
                 ')
 
