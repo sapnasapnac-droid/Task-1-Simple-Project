@@ -1,4 +1,4 @@
-name: Robust Dependency Update Flow (Option C — bisect everything)
+name: Bisection-Based Robust Dependency Update Flow 
 on:
     workflow_dispatch:
         inputs:
