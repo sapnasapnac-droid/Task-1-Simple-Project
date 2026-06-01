@@ -1,4 +1,4 @@
-name: Bisection-Based Robust Dependency Update Flow (cypress)
+name: Dependency Update Flow (cypress)
 on:
     workflow_dispatch:
         inputs:
