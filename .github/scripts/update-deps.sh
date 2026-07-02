@@ -5,7 +5,7 @@
 # GITHUB_OUTPUT is inherited from the calling step, so writes to it still work.
 
 set -o pipefail
-npm install -g npm-check-updates
+npm install -g npm-check-updates semver
 
 TARGET="${UPDATE_LEVEL:-minor}"
 MAX_ATTEMPTS=20
@@ -63,7 +63,8 @@ HAS_TEST=$(npm pkg get scripts.test  | grep -cv '^{}$' || true)
 
 # ---------- State (survives the top-of-loop baseline reset) ----------
 REJECT_LIST=""            # packages held back to baseline
-COUPGRADE_LIST=""         # plugins pulled to LATEST to accommodate the framework
+PIN_LIST=""               # plugins pinned to an EXACT version compatible with the
+                          # framework version being installed. Format: "pkg=ver,pkg=ver".
 NPM_INSTALL_FLAGS=""      # becomes --legacy-peer-deps only as a last resort
 LEGACY_FALLBACK_USED=0
 AI_ATTEMPTS_USED=0
@@ -81,29 +82,113 @@ echo 0 > "$TRIAL_COUNTER"
 
 make_reject_arg() { echo "$REJECT_LIST"; }
 
+# is_pinned PKG → 0 if the package already has a pin
+is_pinned() {
+    local e
+    for e in $(echo "$PIN_LIST" | tr ',' ' '); do
+        [ "${e%%=*}" = "$1" ] && return 0
+    done
+    return 1
+}
+
 # add_reject PKG — enforce invariants centrally:
 #   * NEVER reject the framework (policy: framework is always updated)
-#   * a co-upgraded plugin outranks a reject (don't undo compatibility work)
+#   * a pinned plugin outranks a reject (don't undo compatibility work)
 #   * idempotent
 add_reject() {
     [ "$1" = "$FRAMEWORK_NAME" ] && { echo "::warning::refused to reject framework $1"; return; }
-    echo ",$COUPGRADE_LIST," | grep -q ",$1," && return
-    echo ",$REJECT_LIST,"    | grep -q ",$1," && return
+    is_pinned "$1" && return
+    echo ",$REJECT_LIST," | grep -q ",$1," && return
     REJECT_LIST="${REJECT_LIST:+$REJECT_LIST,}$1"
 }
 
-# add_coupgrade PKG — mark a plugin to be forced to latest; remove it from
-# the reject list if it was there (co-upgrade wins). Idempotent.
-add_coupgrade() {
-    echo ",$COUPGRADE_LIST," | grep -q ",$1," && return
-    COUPGRADE_LIST="${COUPGRADE_LIST:+$COUPGRADE_LIST,}$1"
+# add_pin PKG VERSION — record an exact-version pin; a pin outranks a reject,
+# so remove the package from REJECT_LIST if present. Idempotent per package.
+add_pin() {
+    is_pinned "$1" && return
+    PIN_LIST="${PIN_LIST:+$PIN_LIST,}$1=$2"
     REJECT_LIST=$(echo "$REJECT_LIST" | tr ',' '\n' | grep -vx "$1" | grep -v '^$' | paste -sd, -)
 }
 
-apply_coupgrades() {
-    [ -z "$COUPGRADE_LIST" ] && return
-    local cu; cu=$(echo "$COUPGRADE_LIST" | tr ',' ' ')
-    ncu -u --target latest --filter "$cu" >&2 || true
+# pin_dep PKG VERSION — write an exact version into whichever section holds it.
+pin_dep() {
+    local tmp; tmp=$(mktemp)
+    jq --arg p "$1" --arg v "$2" '
+        if   (.dependencies[$p]    != null) then .dependencies[$p]    = $v
+        elif (.devDependencies[$p] != null) then .devDependencies[$p] = $v
+        else . end
+    ' package.json > "$tmp" && mv "$tmp" package.json
+}
+
+# apply_pins — re-assert every pin over whatever ncu just wrote. Must run every
+# iteration (and inside bisection trials) because the baseline is restored first.
+apply_pins() {
+    [ -z "$PIN_LIST" ] && return
+    local entry
+    for entry in $(echo "$PIN_LIST" | tr ',' ' '); do
+        [ -z "$entry" ] && continue
+        pin_dep "${entry%%=*}" "${entry#*=}"
+    done
+}
+
+# framework_install_version — the CONCRETE framework version npm will install for
+# the range currently in package.json (i.e. the highest release matching it).
+framework_install_version() {
+    local range ver
+    range=$(jq -r --arg fw "$FRAMEWORK_NAME" '(.dependencies[$fw] // .devDependencies[$fw]) // empty' package.json)
+    [ -z "$range" ] && { echo ""; return; }
+    ver=$(npm view "$FRAMEWORK_NAME@$range" version --json 2>/dev/null \
+          | jq -r 'if type=="array" then (.[-1] // "") else (. // "") end' 2>/dev/null)
+    echo "$ver"
+}
+
+# best_compatible_version PLUGIN FRAMEWORK_VER MIN_VER
+# Highest non-prerelease PLUGIN version that (a) is >= MIN_VER (never regress the
+# plugin) and (b) declares a framework peer range satisfied by FRAMEWORK_VER — or
+# declares no framework peer at all. Prints the version, or nothing if none fits.
+best_compatible_version() {
+    local plugin="$1" fver="$2" minver="$3" encoded doc v peer
+    encoded=$(printf '%s' "$plugin" | sed 's|/|%2F|g')
+    doc=$(curl -sS --max-time 30 "https://registry.npmjs.org/$encoded" 2>/dev/null || echo "")
+    [ -z "$doc" ] && return
+    echo "$doc" | jq -r --arg fw "$FRAMEWORK_NAME" '
+        .versions | to_entries[]
+        | select(.key | test("-") | not)                       # skip prereleases
+        | [.key, (.value.peerDependencies[$fw] // "")] | @tsv
+    ' 2>/dev/null | sort -t "$(printf '\t')" -k1,1 -rV | while IFS=$'\t' read -r v peer; do
+        [ -z "$v" ] && continue
+        if [ -n "$minver" ] && ! semver -r ">=$minver" "$v" >/dev/null 2>&1; then continue; fi
+        if [ -z "$peer" ] || semver -r "$peer" "$fver" >/dev/null 2>&1; then
+            echo "$v"; break
+        fi
+    done | head -n1
+}
+
+# resolve_and_pin PLUGIN — find a plugin version compatible with the framework
+# version we're installing and pin it. Returns 0 if a new pin was added.
+# By default it will NOT downgrade the plugin below its current version (so an
+# "update" PR never silently regresses a plugin); set ALLOW_PLUGIN_DOWNGRADE=true
+# to permit picking an older-but-compatible release as a last resort.
+resolve_and_pin() {
+    local plugin="$1" fver base floor best
+    is_pinned "$plugin" && return 1
+    fver=$(framework_install_version)
+    [ -z "$fver" ] && { echo "::warning::could not resolve $FRAMEWORK_NAME install version"; return 1; }
+    base=$(jq -r --arg p "$plugin" '((.dependencies[$p] // .devDependencies[$p]) // "") | sub("^[~^><= ]+";"")' /tmp/pkg.orig)
+    floor="$base"
+    [ "${ALLOW_PLUGIN_DOWNGRADE:-false}" = "true" ] && floor=""
+    best=$(best_compatible_version "$plugin" "$fver" "$floor")
+    if [ -n "$best" ]; then
+        add_pin "$plugin" "$best"
+        if [ -n "$base" ] && semver -r "<$base" "$best" >/dev/null 2>&1; then
+            echo "🤝 Pin $plugin@$best — compatible with $FRAMEWORK_NAME@$fver (⚠️ DOWNGRADE from $base)"
+        else
+            echo "🤝 Pin $plugin@$best — compatible with $FRAMEWORK_NAME@$fver (was $base)"
+        fi
+        return 0
+    fi
+    echo "::warning::No release of $plugin (>= ${floor:-any}) accepts $FRAMEWORK_NAME@$fver — a downgrade may be the only compatible option (set ALLOW_PLUGIN_DOWNGRADE=true to permit it)"
+    return 1
 }
 
 identify_major_bumps() {
@@ -168,7 +253,7 @@ try_majors() {
     else
         ncu -u --target "$TARGET" >&2 || true
     fi
-    apply_coupgrades   # keep framework-compat plugins forward inside trials too
+    apply_pins   # keep framework-compat plugin pins in place inside trials too
 
     local result="pass"
     if ! npm install $NPM_INSTALL_FLAGS >/tmp/bisect.log 2>&1; then
@@ -271,7 +356,7 @@ HARD RULES:
 
     user=$(jq -n \
         --arg fw "$FRAMEWORK_NAME" --arg phase "$phase" \
-        --arg owned "$OUR_DEPS" --arg rej "$REJECT_LIST" --arg cou "$COUPGRADE_LIST" \
+        --arg owned "$OUR_DEPS" --arg rej "$REJECT_LIST" --arg cou "$PIN_LIST" \
         --arg deps "$(jq -c '{dependencies,devDependencies}' package.json)" \
         --arg err "$(tail -c 6000 "$logfile")" \
         '{FRAMEWORK:$fw, PHASE:$phase,
@@ -306,8 +391,9 @@ apply_ai_plan() {
             echo "🤖 AI: force --legacy-peer-deps"; applied=1 ;;
           coupgrade)
             echo "$OUR_DEPS" | grep -qx "$apkg" || { echo "::warning::AI coupgrade of non-owned '$apkg' ignored"; continue; }
-            before="$COUPGRADE_LIST"; add_coupgrade "$apkg"
-            [ "$COUPGRADE_LIST" != "$before" ] && { echo "🤖 AI: coupgrade $apkg"; applied=1; } ;;
+            # resolve_and_pin picks the newest version compatible with the framework
+            # version being installed — never a blind bump to latest.
+            if resolve_and_pin "$apkg"; then applied=1; fi ;;
           reject)
             [ "$apkg" = "$FRAMEWORK_NAME" ] && { echo "::warning::AI tried to reject framework $apkg — REFUSED"; continue; }
             echo "$OUR_DEPS" | grep -qx "$apkg" || { echo "::warning::AI reject of non-owned '$apkg' ignored"; continue; }
@@ -348,10 +434,10 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
         ncu -u --target "$TARGET"
     fi
 
-    # Pull framework-compat plugins forward (must run every iteration).
-    if [ -n "$COUPGRADE_LIST" ]; then
-        echo "🤝 Co-upgrading to latest: $(echo "$COUPGRADE_LIST" | tr ',' ' ')"
-        apply_coupgrades
+    # Re-assert compatibility pins over whatever ncu wrote (must run every iteration).
+    if [ -n "$PIN_LIST" ]; then
+        echo "🤝 Applying compatibility pins: $(echo "$PIN_LIST" | tr ',' ' ')"
+        apply_pins
     fi
 
     # ----- Install -----
@@ -367,28 +453,27 @@ for attempt in $(seq 1 $MAX_ATTEMPTS); do
         fi
 
         # ----- Framework-vs-plugin peer conflict -----
-        # The framework we're bumping is too new for a plugin's peer range.
-        # Reject-to-baseline can't fix this (we never drop the framework);
-        # pull the blocking plugin FORWARD instead.
+        # The framework we're bumping is too new for a plugin's declared peer range.
+        # We never drop the framework, and we must NOT blindly bump the plugin to its
+        # latest (its latest may demand a different framework version → still broken).
+        # Instead pin each blocking plugin to the newest version whose framework peer
+        # range is actually satisfied by the framework version we're installing.
         if grep -qE "peer +${FRAMEWORK_NAME}@" /tmp/install.log; then
             RAWBLOCK=$(grep -oP "from \K[@a-z0-9][@a-z0-9/._-]*(?=@)" /tmp/install.log | sort -u || true)
-            BEFORE_CU="$COUPGRADE_LIST"
+            PROGRESS=0
             while IFS= read -r b; do
                 [ -z "$b" ] && continue
                 [ "$b" = "$FRAMEWORK_NAME" ] && continue
                 echo "$OUR_DEPS" | grep -qx "$b" || continue    # only packages we own
-                add_coupgrade "$b"
+                if resolve_and_pin "$b"; then PROGRESS=1; fi
             done <<< "$RAWBLOCK"
 
-            if [ "$COUPGRADE_LIST" != "$BEFORE_CU" ]; then
-                echo "🤝 $FRAMEWORK_NAME blocked by a plugin peer range — co-upgrading: $COUPGRADE_LIST"
-                continue
-            fi
+            if [ "$PROGRESS" -eq 1 ]; then continue; fi
 
-            # Owned blockers already co-upgraded and it STILL conflicts →
-            # no plugin release accepts this framework version yet.
+            # No plugin version (>= its baseline) accepts this framework version →
+            # the ecosystem hasn't caught up. Force it through for human review.
             if [ "$LEGACY_FALLBACK_USED" -eq 0 ]; then
-                echo "::warning::No plugin release yet accepts $FRAMEWORK_NAME — forcing --legacy-peer-deps (tests will arbitrate)"
+                echo "::warning::No compatible plugin release for the target $FRAMEWORK_NAME version — forcing --legacy-peer-deps (tests will arbitrate)"
                 NPM_INSTALL_FLAGS="--legacy-peer-deps"; LEGACY_FALLBACK_USED=1
                 continue
             fi
@@ -487,7 +572,7 @@ done
 if [ "$LOOP_RESULT" != "success" ]; then
     echo "::error::Could not converge after $MAX_ATTEMPTS attempts"
     echo "Final reject list: $REJECT_LIST"
-    echo "Final co-upgrade list: $COUPGRADE_LIST"
+    echo "Final pin list: $PIN_LIST"
     exit 1
 fi
 
@@ -507,20 +592,15 @@ REJECT_DETAILS=$(jq -r -n \
     "- **\(.)**: `\($old[.])` → `\($probe[.])` _(held back)_"
 ')
 
-# ---------- Co-upgrade report (old → what actually landed) ----------
-COUPGRADE_DETAILS=$(jq -r -n \
-    --slurpfile orig /tmp/pkg.orig \
-    --slurpfile cur package.json \
-    --arg list "$COUPGRADE_LIST" '
-    def safe_obj(x): if (x | type) == "object" then x else {} end;
-    (safe_obj($orig[0].dependencies) + safe_obj($orig[0].devDependencies)) as $old |
-    (safe_obj($cur[0].dependencies)  + safe_obj($cur[0].devDependencies))  as $new |
-    ($list | split(",") | map(select(. != ""))) as $cou |
-    $cou[] |
-    select($old[.] != null and $new[.] != null) |
-    select(($old[.] | type) == "string" and ($new[.] | type) == "string") |
-    "- **\(.)**: `\($old[.])` → `\($new[.])` _(co-upgraded for \($fw // "framework") compatibility)_"
-' --arg fw "$FRAMEWORK_NAME")
+# ---------- Compatibility-pin report (baseline → pinned exact version) ----------
+# PIN_LIST is "pkg=ver,pkg=ver"; report old range vs the exact version we pinned.
+COUPGRADE_LIST=$(echo "$PIN_LIST" | tr ',' '\n' | sed 's/=.*//' | grep -v '^$' | paste -sd, -)
+COUPGRADE_DETAILS=$(
+    printf '%s\n' "$PIN_LIST" | tr ',' '\n' | grep -v '^$' | while IFS='=' read -r p v; do
+        old=$(jq -r --arg p "$p" '((.dependencies[$p] // .devDependencies[$p]) // "") ' /tmp/pkg.orig)
+        echo "- **$p**: \`${old:-—}\` → \`$v\` _(pinned for $FRAMEWORK_NAME compatibility)_"
+    done
+)
 
 {
     echo "attempts=$attempt"
