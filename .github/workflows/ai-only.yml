@@ -1,0 +1,289 @@
+name: AI only Dependency Update Flow (automated)
+
+on:
+  workflow_dispatch:
+    inputs:
+      update_level:
+        description: 'How far to update'
+        required: true
+        default: 'minor'
+        type: choice
+        options:
+          - patch
+          - minor
+          - latest
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    env:
+      HUSKY: 0
+      FRAMEWORK_NAME: cypress
+      # Required. Without it, a failure just fails the job (no AI resolution).
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      AI_MODEL: 'claude-sonnet-4-6'
+      AI_MAX_ATTEMPTS: '5'
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (baseline)
+        run: |
+          set -o pipefail
+          npm ci 2>&1 | tee /tmp/install.log
+
+      - name: Update and heal with AI
+        id: update
+        shell: bash
+        env:
+          # The ONLY templated value; passed as env so the script body has no ${{ }}.
+          UPDATE_LEVEL: ${{ inputs.update_level }}
+        run: |
+          #!/usr/bin/env bash
+          # Minimal AI-driven dependency update.
+          #   1. ncu bumps deps to the requested level
+          #   2. npm install (then build + test if present)
+          #   3. On ANY failure, hand the error to Claude, apply its plan, retry
+          # Config via env (set in the workflow):
+          #   FRAMEWORK_NAME, UPDATE_LEVEL, AI_MODEL, AI_MAX_ATTEMPTS, ANTHROPIC_API_KEY
+          # GitHub runs an inline `run:` block under `bash -eo pipefail`. Turn OFF errexit
+          # (this script handles failures explicitly via if/||) but KEEP pipefail so that
+          # `npm ... | tee` still reports npm's exit code.
+          set +e
+          set -o pipefail
+          touch /tmp/ai_transcript.md
+          
+          FRAMEWORK="${FRAMEWORK_NAME:-cypress}"
+          TARGET="${UPDATE_LEVEL:-minor}"
+          MAX_ROUNDS="${AI_MAX_ATTEMPTS:-5}"
+          MODEL="${AI_MODEL:-claude-sonnet-4-6}"
+          
+          npm install -g npm-check-updates semver >/dev/null 2>&1
+          cp package.json /tmp/pkg.orig
+          
+          # ---- Framework gate: only work if the framework has an update at this level ----
+          if ! ncu "$FRAMEWORK" --target "$TARGET" 2>/dev/null | grep -qE "^[[:space:]]*$FRAMEWORK[[:space:]]"; then
+              echo "::notice::No $FRAMEWORK update available at '$TARGET' — skipping"
+              { echo "test_outcome=skipped"; echo "ai_used=0"; echo "forced_legacy=0"
+                echo "ai_diagnosis<<E"; echo ""; echo "E"; } >> "$GITHUB_OUTPUT"
+              exit 0
+          fi
+          
+          ncu -u --target "$TARGET"
+          
+          OUR_DEPS=$(jq -r '.dependencies, .devDependencies | keys[]' package.json | sort -u)
+          HAS_BUILD=$(npm pkg get scripts.build | grep -cv '^{}$' || true)
+          HAS_TEST=$(npm pkg get scripts.test  | grep -cv '^{}$' || true)
+          
+          NPM_FLAGS=""
+          LEGACY_USED=0
+          AI_ROUNDS=0
+          AI_DIAGNOSIS=""
+          TEST_OUTCOME="skipped"
+          
+          # ---- OPTIONAL context helper: for each owned package named in the error, fetch
+          # its recent versions + framework peer ranges so the model can pick a version that
+          # actually works. Delete this function (and the ctx line in ask_ai) for a purer
+          # "just send the error" setup — the model will then need more rounds to converge.
+          error_context() {
+              local pkgs p enc doc out="{}"
+              pkgs=$(grep -oP "(from |Found: |peer |node_modules/)\K@?[a-z0-9][a-z0-9/._-]*" "$1" \
+                     | sort -u | grep -Fxf <(printf '%s\n' "$OUR_DEPS") || true)
+              [ -z "$pkgs" ] && { echo "{}"; return; }
+              for p in $pkgs; do
+                  enc=$(printf '%s' "$p" | sed 's|/|%2F|g')
+                  doc=$(curl -sS --max-time 20 "https://registry.npmjs.org/$enc" 2>/dev/null || echo "{}")
+                  out=$(echo "$doc" | jq -c --arg p "$p" --arg fw "$FRAMEWORK" --argjson acc "$out" '
+                      $acc + { ($p): ( (.versions // {})
+                          | to_entries | map(select(.key|test("-")|not))
+                          | (sort_by(.key)|reverse)[:15]
+                          | map({ (.key): (.value.peerDependencies[$fw] // null) }) | add ) }
+                  ' 2>/dev/null || echo "$out")
+              done
+              echo "$out"
+          }
+          
+          ask_ai() {   # $1 = logfile → prints a JSON plan (or empty)
+              [ -z "$ANTHROPIC_API_KEY" ] && { echo ""; return; }
+              local ctx sys user body resp
+              ctx=$(error_context "$1")
+              sys='You fix a failing npm dependency update in CI. Output ONLY minified JSON:
+          {"diagnosis":str,"confidence":"high"|"medium"|"low","actions":[{"type":"set_version"|"remove"|"legacy_peer_deps"|"give_up","package":str?,"version":str?}]}
+          The diagnosis MUST be one plain sentence stating the problem and the fix (e.g. "cypress 15.18 exceeds the preprocessor 25.0.0 peer cap <=15.17.0, so pin the preprocessor to 24.0.1 which allows any 15.x").
+          Rules:
+          - NEVER remove FRAMEWORK and NEVER set it below its current package.json version — it must stay updated.
+          - Only touch packages listed in OWNED.
+          - set_version MUST use a real published version taken from VERSIONS. Prefer the newest version whose FRAMEWORK peer range (shown in VERSIONS) is satisfied by the FRAMEWORK version being installed.
+          - Use legacy_peer_deps only if no listed version can satisfy the constraint.
+          - give_up only if the failure is a real code regression, not a version conflict.'
+              user=$(jq -n --arg fw "$FRAMEWORK" --arg owned "$OUR_DEPS" \
+                  --arg deps "$(jq -c '{dependencies,devDependencies}' package.json)" \
+                  --arg err "$(tail -c 6000 "$1")" --argjson versions "$ctx" \
+                  '{FRAMEWORK:$fw, OWNED:($owned|split("\n")|map(select(.!==""))),
+                    CURRENT_DEPS:$deps, VERSIONS:$versions, ERROR:$err}
+                   | "Fix this failure. " + tojson')
+              body=$(jq -n --arg m "$MODEL" --arg s "$sys" --arg u "$user" \
+                  '{model:$m, max_tokens:1024, system:$s, messages:[{role:"user",content:$u}]}')
+              resp=$(curl -sS --max-time 60 https://api.anthropic.com/v1/messages \
+                  -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+                  -H "content-type: application/json" -d "$body" 2>/dev/null || echo '{}')
+              echo "$resp" | jq -r '[.content[]?|select(.type=="text")|.text]|join("")' 2>/dev/null \
+                  | sed 's/```json//g; s/```//g'
+          }
+          
+          set_ver() { local t; t=$(mktemp); jq --arg p "$1" --arg v "$2" \
+              'if .dependencies[$p]!=null then .dependencies[$p]=$v
+               elif .devDependencies[$p]!=null then .devDependencies[$p]=$v else . end' \
+              package.json >"$t" && mv "$t" package.json; }
+          del_dep() { local t; t=$(mktemp); jq --arg p "$1" \
+              'del(.dependencies[$p]) | del(.devDependencies[$p])' package.json >"$t" && mv "$t" package.json; }
+          cur_ver() { jq -r --arg p "$1" '((.dependencies[$p]//.devDependencies[$p])//"")|sub("^[~^><= ]+";"")' package.json; }
+          
+          apply_plan() {   # $1 = plan JSON → 0 applied, 1 nothing actionable, 2 give_up
+              echo "$1" | jq empty 2>/dev/null || { echo "::warning::AI plan is not valid JSON"; return 1; }
+              AI_DIAGNOSIS=$(echo "$1" | jq -r '.diagnosis // ""')
+              : > /tmp/applied.txt
+              local applied=0 t p v fwcur; fwcur=$(cur_ver "$FRAMEWORK")
+              while IFS=$'\t' read -r t p v; do
+                  case "$t" in
+                    legacy_peer_deps) NPM_FLAGS="--legacy-peer-deps"; LEGACY_USED=1
+                      echo "🤖 --legacy-peer-deps"; echo "install with \`--legacy-peer-deps\` (peer checks bypassed)" >> /tmp/applied.txt; applied=1 ;;
+                    give_up) echo "::warning::AI gave up: $AI_DIAGNOSIS"; return 2 ;;
+                    set_version)
+                      echo "$OUR_DEPS" | grep -qx "$p" || { echo "::warning::set of non-owned $p ignored"; continue; }
+                      if [ "$p" = "$FRAMEWORK" ] && [ -n "$fwcur" ] && semver -r "<$fwcur" "$v" >/dev/null 2>&1; then
+                          echo "::warning::refused to downgrade $FRAMEWORK to $v"; continue; fi
+                      set_ver "$p" "$v"; echo "🤖 set $p@$v"; echo "set \`$p\` to \`$v\`" >> /tmp/applied.txt; applied=1 ;;
+                    remove)
+                      [ "$p" = "$FRAMEWORK" ] && { echo "::warning::refused to remove $FRAMEWORK"; continue; }
+                      echo "$OUR_DEPS" | grep -qx "$p" || continue
+                      del_dep "$p"; echo "🤖 remove $p"; echo "removed \`$p\`" >> /tmp/applied.txt; applied=1 ;;
+                    *) echo "::warning::unknown action '$t' ignored" ;;
+                  esac
+              done < <(echo "$1" | jq -r '.actions[]?|[.type,(.package//""),(.version//"")]|@tsv' 2>/dev/null)
+              return $((applied ? 0 : 1))
+          }
+          
+          # record_round PHASE — append a readable "problem → fix" entry to the transcript
+          # (run log + the run Summary page + a var surfaced into the PR body).
+          record_round() {
+              local phase="$1" trigger entry
+              trigger=$(grep -m1 -E "npm error (code |ERESOLVE|While|peer)|Error:|error TS[0-9]|FAIL|✖|failing|not found" /tmp/err.log 2>/dev/null | sed 's/^[[:space:]]*//' | cut -c1-200)
+              entry=$(
+                  echo "### Round $AI_ROUNDS — \`$phase\` step failed"
+                  [ -n "$trigger" ] && printf '**What broke:** `%s`\n' "$trigger"
+                  echo "**Problem (AI):** ${AI_DIAGNOSIS:-<none>}"
+                  echo "**Fix applied by AI:**"
+                  if [ -s /tmp/applied.txt ]; then sed 's/^/- /' /tmp/applied.txt; else echo "- (none)"; fi
+                  echo
+              )
+              printf '%s\n' "$entry" >> /tmp/ai_transcript.md
+              printf '%s\n' "$entry" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+              printf '%s\n' "$entry"
+          }
+          
+          # ---- Heal loop: install → build → test; any failure → AI → retry ----
+          for round in $(seq 0 "$MAX_ROUNDS"); do
+              echo "===== Round $round ====="
+              rm -rf node_modules
+          
+              if ! npm install $NPM_FLAGS 2>&1 | tee /tmp/err.log; then
+                  phase=install
+              elif [ "$HAS_BUILD" -gt 0 ] && ! npm run build 2>&1 | tee /tmp/err.log; then
+                  phase=build
+              elif [ "$HAS_TEST" -gt 0 ] && ! npm test 2>&1 | tee /tmp/err.log; then
+                  phase=test; TEST_OUTCOME=failure
+              else
+                  [ "$HAS_TEST" -gt 0 ] && TEST_OUTCOME=success
+                  echo "✅ Converged in round $round"; break
+              fi
+              echo "❌ Failure during: $phase"
+          
+              if [ "$AI_ROUNDS" -ge "$MAX_ROUNDS" ] || [ -z "$ANTHROPIC_API_KEY" ]; then
+                  [ -z "$ANTHROPIC_API_KEY" ] && echo "::warning::ANTHROPIC_API_KEY not set"
+                  if [ "$phase" = "test" ]; then
+                      echo "::warning::Tests still failing — shipping PR for human review"; break; fi
+                  echo "::error::$phase failure unresolved (AI budget/key exhausted)"; cat /tmp/err.log; exit 1
+              fi
+          
+              AI_ROUNDS=$((AI_ROUNDS + 1))
+              echo "🤖 Asking $MODEL to resolve the $phase failure (round $AI_ROUNDS/$MAX_ROUNDS)"
+              PLAN=$(ask_ai /tmp/err.log)
+              echo "AI plan: ${PLAN:-<empty>}"
+              apply_plan "$PLAN"; rc=$?
+          
+              if [ "$rc" -eq 2 ]; then          # give_up
+                  record_round "$phase"
+                  if [ "$phase" = "test" ]; then break; fi
+                  cat /tmp/err.log; exit 1
+              fi
+              if [ "$rc" -ne 0 ]; then           # nothing actionable
+                  if [ "$phase" = "test" ]; then
+                      echo "::warning::No actionable fix — shipping PR for human review"; break; fi
+                  echo "::error::AI proposed nothing actionable at $phase"; cat /tmp/err.log; exit 1
+              fi
+              record_round "$phase"
+          done
+          
+          {
+              echo "test_outcome=$TEST_OUTCOME"
+              echo "ai_used=$AI_ROUNDS"
+              echo "forced_legacy=$LEGACY_USED"
+              echo "ai_diagnosis<<E"
+              echo "$AI_DIAGNOSIS"
+              echo "E"
+              echo "ai_transcript<<T"
+              cat /tmp/ai_transcript.md 2>/dev/null
+              echo "T"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check for changes
+        id: changed
+        run: |
+          if git diff --quiet package.json package-lock.json; then
+              echo "had_changes=false" >> $GITHUB_OUTPUT
+              echo "::notice::No dependency updates were available this run"
+          else
+              echo "had_changes=true" >> $GITHUB_OUTPUT
+              echo "Changes detected — will create PR"
+          fi
+
+      - name: Create Pull Request
+        if: steps.changed.outputs.had_changes == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})"
+          title: >-
+            ${{ (steps.update.outputs.test_outcome == 'failure' || steps.update.outputs.forced_legacy == '1') && '⚠️ [NEEDS REVIEW] ' || '' }}chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})
+          labels: >-
+            ${{ (steps.update.outputs.test_outcome == 'failure' || steps.update.outputs.forced_legacy == '1' || steps.update.outputs.ai_used != '0') && 'dependencies,needs-review' || 'dependencies,automated' }}${{ steps.update.outputs.test_outcome == 'failure' && ',tests-failing' || '' }}${{ steps.update.outputs.forced_legacy == '1' && ',forced-peer-deps' || '' }}${{ steps.update.outputs.ai_used != '0' && ',ai-assisted' || '' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}
+          body: |
+            Automatic dependency update.
+
+            ## Summary
+            - **Framework focus:** `${{ env.FRAMEWORK_NAME }}`
+            - **Update level:** `${{ inputs.update_level }}`
+            - **Test result:** ${{ steps.update.outputs.test_outcome }}
+            - **AI rounds used:** ${{ steps.update.outputs.ai_used }}
+            - **Forced --legacy-peer-deps:** ${{ steps.update.outputs.forced_legacy == '1' && 'yes' || 'no' }}
+            ${{ steps.update.outputs.ai_used != '0' && format('{0}## How the AI resolved it{0}{0}{1}', '
+            ', steps.update.outputs.ai_transcript) || '' }}
+            ## Review Guidance
+            ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ **Tests are failing.** Likely a real regression — investigate before merging.' || '✅ Tests passed (or none defined).' }}
+            ${{ steps.update.outputs.forced_legacy == '1' && '⚠️ **This PR used `--legacy-peer-deps`.** npm''s peer checks were bypassed; tests are the only compatibility evidence.' || '' }}
+
+            Generated by run #${{ github.run_number }}.
+          branch: chore/deps-${{ env.FRAMEWORK_NAME }}-${{ inputs.update_level }}-${{ github.run_id }}
+          delete-branch: true
