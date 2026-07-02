@@ -24,6 +24,10 @@ jobs:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       AI_MODEL: 'claude-sonnet-4-6'
       AI_MAX_ATTEMPTS: '2'
+      # If no plugin release >= its current version accepts the new framework
+      # version, allow pinning an older-but-compatible plugin release instead of
+      # falling back to --legacy-peer-deps. Default false (safer for an update PR).
+      ALLOW_PLUGIN_DOWNGRADE: 'false'
     permissions:
       contents: write
       pull-requests: write
