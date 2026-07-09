@@ -9,7 +9,424 @@ on:
         default: 'minor'
         type: choice
         options:
-          - patch
+          - patchname: Dependency Update Flow (peer-resolve + Claude heal)
+on:
+    workflow_dispatch:
+        inputs:
+            update_level:
+                description: 'How far to update'
+                required: true
+                default: 'minor'
+                type: choice
+                options:
+                    - patch
+                    - minor
+                    - latest
+
+jobs:
+    update:
+
+        runs-on: ubuntu-latest
+        env:
+            HUSKY: 0
+            FRAMEWORK_NAME: cypress
+            LEGACY_PEER_DEPS_FALLBACK: '1'  # last resort so the framework can stay at target
+            ENABLE_CLAUDE_FIX: '1'
+            CLAUDE_MODEL: claude-opus-4-8   # claude-sonnet-5 is cheaper
+            CLAUDE_MAX_TURNS: '10'
+            ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        permissions:
+            contents: write
+            pull-requests: write
+            issues: write
+
+        steps:
+
+            - name: Checkout code
+              uses: actions/checkout@v5
+
+            - name: Set up Node.js
+              uses: actions/setup-node@v5
+              with:
+                node-version-file: '.nvmrc'
+                cache: 'npm'
+
+            - name: Install Claude Code CLI
+              if: ${{ env.ENABLE_CLAUDE_FIX == '1' }}
+              run: npm install -g @anthropic-ai/claude-code
+
+            - name: Install dependencies (baseline)
+              run: |
+                set -o pipefail
+                npm ci 2>&1 | tee /tmp/install.log
+
+            - name: Update, resolve peer conflicts, then heal with Claude
+              id: update
+              shell: bash
+              run: |
+                set -o pipefail
+                npm install -g npm-check-updates
+
+                # ---- Registry resolver: newest version of a consumer whose peer range
+                #      accepts the framework target (Node + semver, lives beside its deps). ----
+                npm install --prefix /tmp/resolver semver >/dev/null 2>&1
+                cat > /tmp/resolver/resolve_pin.mjs <<'MJSEOF'
+                import semver from 'semver';
+                const [framework, targetRaw, consumer] = process.argv.slice(2);
+                function coerceTarget(raw) {
+                  if (semver.valid(raw)) return raw;
+                  const mv = semver.minVersion(raw);
+                  if (mv) return mv.version;
+                  const c = semver.coerce(raw);
+                  return c ? c.version : null;
+                }
+                const target = coerceTarget(targetRaw || '');
+                if (!target || !framework || !consumer) process.exit(0);
+                let doc;
+                try {
+                  const res = await fetch(`https://registry.npmjs.org/${consumer}`, {
+                    headers: { accept: 'application/vnd.npm.install-v1+json' }
+                  });
+                  if (!res.ok) process.exit(0);
+                  doc = await res.json();
+                } catch { process.exit(0); }
+                const best = Object.entries(doc.versions || {})
+                  .filter(([v]) => semver.valid(v) && !semver.prerelease(v))
+                  .map(([v, m]) => ({ v, range: (m.peerDependencies && m.peerDependencies[framework]) || '*' }))
+                  .filter(x => { try { return semver.satisfies(target, x.range); } catch { return false; } })
+                  .map(x => x.v)
+                  .sort(semver.rcompare)[0];
+                if (best) process.stdout.write(best);
+                MJSEOF
+
+                TARGET="${{ inputs.update_level }}"
+                MAX_ATTEMPTS=20
+
+                cp package.json /tmp/pkg.orig
+                cp package-lock.json /tmp/lock.orig
+
+                if ! jq empty /tmp/pkg.orig 2>/dev/null; then
+                    echo "::error::Baseline package.json is not valid JSON — aborting"; exit 1
+                fi
+
+                # ---------- Framework gate: only work if the framework has an update ----------
+                if ! ncu "$FRAMEWORK_NAME" --target "$TARGET" 2>/dev/null \
+                        | grep -qE "^[[:space:]]*$FRAMEWORK_NAME[[:space:]]"; then
+                    echo "::notice::No $FRAMEWORK_NAME update at target '$TARGET' — skipping"
+                    {
+                        echo "attempts=0"
+                        echo "outcome=skipped"
+                        echo "ai_fix_applied=false"
+                        echo "legacy_used=false"
+                        echo "ai_fix_summary<<EOF"; echo ""; echo "EOF"
+                        echo "pins_details<<EOF";   echo ""; echo "EOF"
+                    } >> $GITHUB_OUTPUT
+                    exit 0
+                fi
+                echo "✅ $FRAMEWORK_NAME has an update — proceeding"
+
+                # ---------- Probe (for the 'held back' report only) ----------
+                cp /tmp/pkg.orig /tmp/probe.json
+                PROBE=$(ncu --packageFile /tmp/probe.json --target "$TARGET" --jsonUpgraded 2>/dev/null || echo '{}')
+                echo "$PROBE" | jq empty >/dev/null 2>&1 || PROBE='{}'
+
+                OUR_DEPS=$(jq -r '.dependencies, .devDependencies | keys[]' package.json | sort -u)
+                HAS_BUILD=$(npm pkg get scripts.build | grep -cv '^{}$' || true)
+                HAS_TEST=$(npm pkg get scripts.test  | grep -cv '^{}$' || true)
+
+                OUTCOME=""            # success | build_failing | test_failing
+                AI_FIX_APPLIED="false"
+                AI_FIX_SUMMARY=""
+                LEGACY_USED=0
+                : > /tmp/pins         # name<TAB>version<TAB>section
+
+                # ---------- Pin machinery ----------
+                section_of() {
+                    if jq -e --arg n "$1" '.dependencies[$n]'    /tmp/pkg.orig >/dev/null 2>&1; then echo dependencies
+                    elif jq -e --arg n "$1" '.devDependencies[$n]' /tmp/pkg.orig >/dev/null 2>&1; then echo devDependencies
+                    else echo dependencies; fi
+                }
+                set_pin() {   # NAME VERSION SECTION -> 0 if changed, 1 if already set
+                    local n="$1" v="$2" s="$3" cur
+                    cur=$(awk -F'\t' -v n="$n" '$1==n{print $2}' /tmp/pins | head -n1)
+                    [ "$cur" = "$v" ] && return 1
+                    awk -F'\t' -v n="$n" '$1!=n' /tmp/pins > /tmp/pins.new 2>/dev/null || true
+                    printf '%s\t%s\t%s\n' "$n" "$v" "$s" >> /tmp/pins.new
+                    mv /tmp/pins.new /tmp/pins; return 0
+                }
+                apply_pins() {
+                    [ -s /tmp/pins ] || return 0
+                    local n v s tmp
+                    while IFS=$'\t' read -r n v s; do
+                        [ -z "$n" ] && continue
+                        tmp=$(mktemp)
+                        jq --arg s "$s" --arg n "$n" --arg v "$v" '.[$s][$n]=$v' package.json > "$tmp" && mv "$tmp" package.json
+                        echo "📌 pin $n@$v ($s)"
+                    done < /tmp/pins
+                }
+                resolve_pin() { node /tmp/resolver/resolve_pin.mjs "$FRAMEWORK_NAME" "$2" "$1" 2>/dev/null; }
+
+                # ---------- Claude fixer (source/config only, verified by caller) ----------
+                claude_fix() {
+                    local phase="$1" logfile="$2"
+                    [ "${ENABLE_CLAUDE_FIX:-0}" = "1" ] || { echo "unfixed"; return; }
+                    if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+                        echo "::warning::ANTHROPIC_API_KEY unset — skipping Claude" >&2; echo "unfixed"; return
+                    fi
+                    rm -rf /tmp/pre_claude; mkdir -p /tmp/pre_claude
+                    rsync -a --exclude node_modules --exclude .git ./ /tmp/pre_claude/ >&2
+                    local err; err=$(tail -c 8000 "$logfile")
+                    local sys
+                    sys="You are fixing a dependency-upgrade failure in the sauce-cypress-runner repo (a Cypress test runner).
+STRICT RULES:
+- You may ONLY edit application source and configuration (e.g. src/, tsconfig.json, eslint config).
+- You MUST NOT edit, weaken, disable, or delete anything under tests/. Never change a test to make it pass.
+- You MUST NOT edit package.json or package-lock.json — dependency versions are controlled by CI.
+- Make the SMALLEST change that makes the code compatible with the upgraded dependency.
+- If it cannot be fixed without touching tests/ or package files, make NO changes at all."
+                    echo "::group::Claude fix (phase=$phase)" >&2
+                    claude -p "The '$phase' step failed after a dependency upgrade. Error output:
+
+$err
+
+Read the relevant source, find the root cause, and apply the minimal compatible fix following the rules." \
+                        --model "$CLAUDE_MODEL" --max-turns "$CLAUDE_MAX_TURNS" \
+                        --allowedTools "Read,Edit,Write,Grep,Glob" \
+                        --append-system-prompt "$sys" >/tmp/claude.log 2>&1 || true
+                    tail -n 40 /tmp/claude.log >&2 || true
+                    echo "::endgroup::" >&2
+                    if ! git diff --quiet -- tests/ 2>/dev/null; then
+                        echo "::warning::Claude touched tests/ — reverting" >&2
+                        rsync -a --delete --exclude node_modules --exclude .git /tmp/pre_claude/ ./ >&2
+                        echo "unfixed"; return
+                    fi
+                    if ! git diff --quiet -- package.json package-lock.json 2>/dev/null; then
+                        echo "::warning::Claude touched package files — reverting" >&2
+                        rsync -a --delete --exclude node_modules --exclude .git /tmp/pre_claude/ ./ >&2
+                        echo "unfixed"; return
+                    fi
+                    if git diff --quiet -- . 2>/dev/null; then echo "unfixed"; return; fi
+                    echo "fixed"
+                }
+                revert_claude() { rsync -a --delete --exclude node_modules --exclude .git /tmp/pre_claude/ ./ >&2; }
+                record_ai_fix() {
+                    local stat; stat=$(git diff --stat -- . ':(exclude)package.json' ':(exclude)package-lock.json' 2>/dev/null)
+                    AI_FIX_APPLIED="true"
+                    AI_FIX_SUMMARY="${AI_FIX_SUMMARY}
+**Fix applied during \`$1\` phase:**
+\`\`\`
+${stat}
+\`\`\`
+"
+                }
+
+                # ================= Main loop =================
+                for attempt in $(seq 1 $MAX_ATTEMPTS); do
+                    echo ""
+                    echo "===== Attempt $attempt of $MAX_ATTEMPTS ====="
+
+                    rm -rf node_modules lib dist
+                    cp /tmp/pkg.orig package.json
+                    cp /tmp/lock.orig package-lock.json
+                    git checkout -- . 2>/dev/null || true
+
+                    # STAGE 1: apply the updates and install.
+                    ncu -u --target "$TARGET"
+                    apply_pins
+                    npm install 2>&1 | tee /tmp/install.log
+                    INSTALL_EXIT=${PIPESTATUS[0]}
+
+                    # STAGE 2: peer conflict -> resolve and retry.
+                    if [ $INSTALL_EXIT -ne 0 ]; then
+                        if grep -qE "ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN" /tmp/install.log; then
+                            echo "::warning::Network issue, retrying in 10s"; sleep 10; continue
+                        fi
+                        if ! grep -q "ERESOLVE" /tmp/install.log; then
+                            echo "::error::Install failed for a non-peer reason (not fixable by editing source)."
+                            cat /tmp/install.log; exit 1
+                        fi
+
+                        # Keep the framework at target; pin whatever constrains it to the
+                        # newest published version that accepts the target.
+                        F_TARGET_RAW=$(jq -r --arg f "$FRAMEWORK_NAME" '(.dependencies[$f] // .devDependencies[$f]) // ""' package.json)
+                        CONSUMERS=$( {
+                            grep -oP "from \K[@a-z0-9._/-]+(?=@)" /tmp/install.log
+                            grep -oP "Conflicting peer dependency: \K[@a-z0-9._/-]+" /tmp/install.log
+                        } | sort -u )
+
+                        PROGRESS=0; HOPELESS=""; UNOWNED=""
+                        while read -r consumer; do
+                            [ -z "$consumer" ] && continue
+                            if [ "$consumer" = "$FRAMEWORK_NAME" ]; then
+                                echo "🛡️  Protecting $FRAMEWORK_NAME"; continue
+                            fi
+                            if ! echo "$OUR_DEPS" | grep -qx "$consumer"; then
+                                UNOWNED="${UNOWNED:+$UNOWNED,}$consumer"; continue
+                            fi
+                            COMPAT=$(resolve_pin "$consumer" "$F_TARGET_RAW")
+                            if [ -n "$COMPAT" ]; then
+                                if set_pin "$consumer" "$COMPAT" "$(section_of "$consumer")"; then
+                                    echo "📌 Will pin $consumer -> $COMPAT (keeps $FRAMEWORK_NAME@$F_TARGET_RAW)"; PROGRESS=1
+                                else
+                                    echo "…$consumer already pinned at $COMPAT but conflict persists"
+                                fi
+                            else
+                                echo "⛔ No published $consumer accepts $FRAMEWORK_NAME@$F_TARGET_RAW"
+                                HOPELESS="${HOPELESS:+$HOPELESS,}$consumer"
+                            fi
+                        done <<< "$CONSUMERS"
+
+                        if [ "$PROGRESS" -eq 1 ]; then continue; fi
+
+                        # Nothing left to pin without moving the framework.
+                        if [ -n "$HOPELESS" ] || [ -n "$UNOWNED" ]; then
+                            if [ "${LEGACY_PEER_DEPS_FALLBACK:-0}" = "1" ]; then
+                                echo "::warning::Peers unsatisfiable while keeping $FRAMEWORK_NAME at target (none-compatible: ${HOPELESS:-none}; transitive: ${UNOWNED:-none}). Forcing install with --legacy-peer-deps."
+                                if npm install --legacy-peer-deps 2>&1 | tee /tmp/install.log; then
+                                    LEGACY_USED=1     # fall through to build/test
+                                else
+                                    echo "::error::--legacy-peer-deps install still failed"; cat /tmp/install.log; exit 1
+                                fi
+                            else
+                                echo "::error::Cannot keep $FRAMEWORK_NAME at target: no compatible version of [ ${HOPELESS:-} ${UNOWNED:+(transitive) $UNOWNED} ] exists."
+                                echo "::error::Wait for upstream, lower the update level, or set LEGACY_PEER_DEPS_FALLBACK=1."
+                                cat /tmp/install.log; exit 1
+                            fi
+                        else
+                            echo "::error::ERESOLVE but only $FRAMEWORK_NAME is implicated (protected) — nothing to act on."
+                            cat /tmp/install.log; exit 1
+                        fi
+                    fi
+
+                    # STAGE 3: install succeeded. Build/test failures go to Claude.
+                    if [ "$HAS_BUILD" -gt 0 ]; then
+                        echo "Running build..."
+                        if npm run build 2>&1 | tee /tmp/build.log; then
+                            echo "✅ Build succeeded"
+                        else
+                            FIX=$(claude_fix "build" /tmp/build.log)
+                            if [ "$FIX" = "fixed" ]; then
+                                echo "🤖 Verifying Claude build fix..."
+                                if npm run build >/tmp/verify.log 2>&1; then
+                                    echo "✅ Verified"; record_ai_fix "build"
+                                else
+                                    echo "❌ Verification failed — reverting"; cat /tmp/verify.log
+                                    revert_claude; FIX="unfixed"
+                                fi
+                            fi
+                            if [ "$FIX" != "fixed" ]; then
+                                echo "::warning::Build still failing after Claude — shipping PR for human review"
+                                OUTCOME="build_failing"; break
+                            fi
+                        fi
+                    fi
+
+                    if [ "$HAS_TEST" -gt 0 ]; then
+                        echo "Running tests..."
+                        if npm test 2>&1 | tee /tmp/test.log; then
+                            echo "✅ Tests passed"; OUTCOME="success"; break
+                        else
+                            FIX=$(claude_fix "test" /tmp/test.log)
+                            if [ "$FIX" = "fixed" ]; then
+                                echo "🤖 Verifying Claude test fix..."
+                                VERIFY_OK=1
+                                if [ "$HAS_BUILD" -gt 0 ] && ! npm run build >/tmp/verify.log 2>&1; then VERIFY_OK=0; fi
+                                if [ "$VERIFY_OK" -eq 1 ] && ! npm test >>/tmp/verify.log 2>&1; then VERIFY_OK=0; fi
+                                if [ "$VERIFY_OK" -eq 1 ]; then
+                                    echo "✅ Verified"; record_ai_fix "test"; OUTCOME="success"; break
+                                else
+                                    echo "❌ Verification failed — reverting"; cat /tmp/verify.log
+                                    revert_claude; FIX="unfixed"
+                                fi
+                            fi
+                            if [ "$FIX" != "fixed" ]; then
+                                echo "::warning::Tests still failing after Claude — shipping PR for human review"
+                                OUTCOME="test_failing"; break
+                            fi
+                        fi
+                    fi
+
+                    OUTCOME="success"; break
+                done
+
+                if [ -z "$OUTCOME" ]; then
+                    echo "::error::Could not resolve peer conflicts within $MAX_ATTEMPTS attempts"
+                    exit 1
+                fi
+
+                # ---------- Pins report ----------
+                PINS_DETAILS=""
+                if [ -s /tmp/pins ]; then
+                    while IFS=$'\t' read -r n v s; do
+                        [ -z "$n" ] && continue
+                        latest=$(echo "$PROBE" | jq -r --arg n "$n" '.[$n] // "current"')
+                        PINS_DETAILS="${PINS_DETAILS}- **${n}**: pinned to \`${v}\` (latest is \`${latest}\`) so \`${FRAMEWORK_NAME}\` stays current
+"
+                    done < /tmp/pins
+                fi
+                LEGACY_USED_STR=$([ "$LEGACY_USED" = "1" ] && echo true || echo false)
+
+                {
+                    echo "attempts=$attempt"
+                    echo "outcome=$OUTCOME"
+                    echo "ai_fix_applied=$AI_FIX_APPLIED"
+                    echo "legacy_used=$LEGACY_USED_STR"
+                    echo "ai_fix_summary<<EOF"; echo "$AI_FIX_SUMMARY"; echo "EOF"
+                    echo "pins_details<<EOF";   echo "$PINS_DETAILS";   echo "EOF"
+                } >> $GITHUB_OUTPUT
+
+            - name: Check for changes
+              id: changed
+              run: |
+                if git diff --quiet; then
+                    echo "had_changes=false" >> $GITHUB_OUTPUT
+                    echo "::notice::No changes this run"
+                else
+                    echo "had_changes=true" >> $GITHUB_OUTPUT
+                fi
+
+            - name: Create Pull Request
+              if: steps.changed.outputs.had_changes == 'true'
+              uses: peter-evans/create-pull-request@v7
+              with:
+                token: ${{ secrets.GITHUB_TOKEN }}
+                commit-message: "chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})"
+                title: |
+                  ${{ steps.update.outputs.outcome == 'build_failing' && '⚠️ [BUILD FAILING] ' || steps.update.outputs.outcome == 'test_failing' && '⚠️ [TESTS FAILING] ' || '' }}${{ steps.update.outputs.ai_fix_applied == 'true' && '🤖 [AI FIX] ' || '' }}chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})
+                labels: |
+                  ${{ (steps.update.outputs.outcome == 'build_failing' || steps.update.outputs.outcome == 'test_failing') && 'dependencies,needs-review' || 'dependencies,automated' }}${{ steps.update.outputs.outcome == 'build_failing' && ',build-failing' || '' }}${{ steps.update.outputs.outcome == 'test_failing' && ',tests-failing' || '' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}${{ steps.update.outputs.ai_fix_applied == 'true' && ',ai-fix,needs-careful-review' || '' }}${{ steps.update.outputs.pins_details != '' && ',framework-pinned-deps' || '' }}${{ steps.update.outputs.legacy_used == 'true' && ',legacy-peer-deps' || '' }}
+                body: |
+                    Automatic dependency update. Policy: keep **${{ env.FRAMEWORK_NAME }}** at target; resolve peer conflicts by pinning blockers; hand build/test failures to Claude.
+
+                    ## Summary
+                    - **Framework:** `${{ env.FRAMEWORK_NAME }}` (kept at target)
+                    - **Update level:** `${{ inputs.update_level }}`
+                    - **Attempts:** ${{ steps.update.outputs.attempts }}
+                    - **Outcome:** ${{ steps.update.outputs.outcome }}
+                    - **AI fix applied:** ${{ steps.update.outputs.ai_fix_applied }}
+                    - **Forced install (--legacy-peer-deps):** ${{ steps.update.outputs.legacy_used }}
+
+                    ${{ steps.update.outputs.pins_details != '' && '## Consumers pinned to keep the framework current
+
+                    Held below their newest release because that release does not yet accept the framework at target. They advance automatically once upstream widens its peer range.
+' || '' }}
+                    ${{ steps.update.outputs.pins_details }}
+
+                    ${{ steps.update.outputs.ai_fix_applied == 'true' && '## 🤖 AI-applied source fixes
+
+                    Applied by Claude Code and **verified by a real build/test run** before this PR opened. Claude was restricted to source/config only — blocked from `tests/`, `package.json`, and `package-lock.json`. **Review carefully.**
+' || '' }}
+                    ${{ steps.update.outputs.ai_fix_summary }}
+
+                    ## Review Guidance
+                    ${{ steps.update.outputs.legacy_used == 'true' && '⚠️ Install forced with `--legacy-peer-deps`; the dependency tree may be technically invalid even though it installed. Review before merging.' || '' }}
+                    ${{ steps.update.outputs.outcome == 'build_failing' && '⚠️ **Build fails and Claude could not fix it.** A human needs to take over.' || '' }}
+                    ${{ steps.update.outputs.outcome == 'test_failing' && '⚠️ **Tests fail and Claude could not fix them.** Investigate before merging.' || '' }}
+                    ${{ steps.update.outputs.outcome == 'success' && '✅ Build and tests passed.' || '' }}
+
+                    Generated by run #${{ github.run_number }}.
+                branch: chore/deps-${{ env.FRAMEWORK_NAME }}-${{ inputs.update_level }}-${{ github.run_id }}
+                delete-branch: true
           - minor
           - latest
 
