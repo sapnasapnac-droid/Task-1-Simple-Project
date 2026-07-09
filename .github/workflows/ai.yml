@@ -1,15 +1,4 @@
-name: AI Dependency Update Flow (automated)
-
-on:
-  workflow_dispatch:
-    inputs:
-      update_level:
-        description: 'How far to update'
-        required: true
-        default: 'minor'
-        type: choice
-        options:
-          - patchname: Dependency Update Flow (peer-resolve + Claude heal)
+name: Dependency Update Flow (peer-resolve + Claude heal)
 on:
     workflow_dispatch:
         inputs:
@@ -118,8 +107,8 @@ jobs:
                         echo "outcome=skipped"
                         echo "ai_fix_applied=false"
                         echo "legacy_used=false"
-                        echo "ai_fix_summary<<EOF"; echo ""; echo "EOF"
-                        echo "pins_details<<EOF";   echo ""; echo "EOF"
+                        echo "pins_details<<PINEOF"; echo ""; echo "PINEOF"
+                        echo "pr_body<<PRBODYEOF"; echo "No $FRAMEWORK_NAME update available."; echo "PRBODYEOF"
                     } >> $GITHUB_OUTPUT
                     exit 0
                 fi
@@ -175,21 +164,12 @@ jobs:
                     fi
                     rm -rf /tmp/pre_claude; mkdir -p /tmp/pre_claude
                     rsync -a --exclude node_modules --exclude .git ./ /tmp/pre_claude/ >&2
-                    local err; err=$(tail -c 8000 "$logfile")
-                    local sys
-                    sys="You are fixing a dependency-upgrade failure in the sauce-cypress-runner repo (a Cypress test runner).
-STRICT RULES:
-- You may ONLY edit application source and configuration (e.g. src/, tsconfig.json, eslint config).
-- You MUST NOT edit, weaken, disable, or delete anything under tests/. Never change a test to make it pass.
-- You MUST NOT edit package.json or package-lock.json — dependency versions are controlled by CI.
-- Make the SMALLEST change that makes the code compatible with the upgraded dependency.
-- If it cannot be fixed without touching tests/ or package files, make NO changes at all."
+                    local err sys prompt
+                    err=$(tail -c 8000 "$logfile")
+                    sys=$'You are fixing a dependency-upgrade failure in the sauce-cypress-runner repo (a Cypress test runner).\nSTRICT RULES:\n- You may ONLY edit application source and configuration (e.g. src/, tsconfig.json, eslint config).\n- You MUST NOT edit, weaken, disable, or delete anything under tests/. Never change a test to make it pass.\n- You MUST NOT edit package.json or package-lock.json - dependency versions are controlled by CI.\n- Make the SMALLEST change that makes the code compatible with the upgraded dependency.\n- If it cannot be fixed without touching tests/ or package files, make NO changes at all.'
+                    printf -v prompt 'The '\''%s'\'' step failed after a dependency upgrade. Error output:\n\n%s\n\nRead the relevant source, find the root cause, and apply the minimal compatible fix following the rules.' "$phase" "$err"
                     echo "::group::Claude fix (phase=$phase)" >&2
-                    claude -p "The '$phase' step failed after a dependency upgrade. Error output:
-
-$err
-
-Read the relevant source, find the root cause, and apply the minimal compatible fix following the rules." \
+                    claude -p "$prompt" \
                         --model "$CLAUDE_MODEL" --max-turns "$CLAUDE_MAX_TURNS" \
                         --allowedTools "Read,Edit,Write,Grep,Glob" \
                         --append-system-prompt "$sys" >/tmp/claude.log 2>&1 || true
@@ -210,14 +190,11 @@ Read the relevant source, find the root cause, and apply the minimal compatible 
                 }
                 revert_claude() { rsync -a --delete --exclude node_modules --exclude .git /tmp/pre_claude/ ./ >&2; }
                 record_ai_fix() {
-                    local stat; stat=$(git diff --stat -- . ':(exclude)package.json' ':(exclude)package-lock.json' 2>/dev/null)
+                    local stat block
+                    stat=$(git diff --stat -- . ':(exclude)package.json' ':(exclude)package-lock.json' 2>/dev/null)
                     AI_FIX_APPLIED="true"
-                    AI_FIX_SUMMARY="${AI_FIX_SUMMARY}
-**Fix applied during \`$1\` phase:**
-\`\`\`
-${stat}
-\`\`\`
-"
+                    printf -v block '\n**Fix applied during `%s` phase:**\n```\n%s\n```\n' "$1" "$stat"
+                    AI_FIX_SUMMARY="${AI_FIX_SUMMARY}${block}"
                 }
 
                 # ================= Main loop =================
@@ -281,7 +258,7 @@ ${stat}
                         # Nothing left to pin without moving the framework.
                         if [ -n "$HOPELESS" ] || [ -n "$UNOWNED" ]; then
                             if [ "${LEGACY_PEER_DEPS_FALLBACK:-0}" = "1" ]; then
-                                echo "::warning::Peers unsatisfiable while keeping $FRAMEWORK_NAME at target (none-compatible: ${HOPELESS:-none}; transitive: ${UNOWNED:-none}). Forcing install with --legacy-peer-deps."
+                                echo "::warning::Peers unsatisfiable while keeping $FRAMEWORK_NAME at target (none-compatible: ${HOPELESS:-none}; transitive: ${UNOWNED:-none}). Forcing --legacy-peer-deps."
                                 if npm install --legacy-peer-deps 2>&1 | tee /tmp/install.log; then
                                     LEGACY_USED=1     # fall through to build/test
                                 else
@@ -360,19 +337,55 @@ ${stat}
                     while IFS=$'\t' read -r n v s; do
                         [ -z "$n" ] && continue
                         latest=$(echo "$PROBE" | jq -r --arg n "$n" '.[$n] // "current"')
-                        PINS_DETAILS="${PINS_DETAILS}- **${n}**: pinned to \`${v}\` (latest is \`${latest}\`) so \`${FRAMEWORK_NAME}\` stays current
-"
+                        printf -v pins_line '- **%s**: pinned to `%s` (latest is `%s`) so `%s` stays current\n' "$n" "$v" "$latest" "$FRAMEWORK_NAME"
+                        PINS_DETAILS="${PINS_DETAILS}${pins_line}"
                     done < /tmp/pins
                 fi
                 LEGACY_USED_STR=$([ "$LEGACY_USED" = "1" ] && echo true || echo false)
+
+                # ---------- Assemble PR body in bash (kept out of YAML on purpose) ----------
+                PR_BODY=""
+                appendb() { PR_BODY="${PR_BODY}$1"$'\n'; }
+                appendb "Automatic dependency update. Policy: keep **${FRAMEWORK_NAME}** at target; resolve peer conflicts by pinning blockers; hand build/test failures to Claude."
+                appendb ""
+                appendb "## Summary"
+                appendb "- **Framework:** \`${FRAMEWORK_NAME}\` (kept at target)"
+                appendb "- **Update level:** \`${TARGET}\`"
+                appendb "- **Attempts:** ${attempt}"
+                appendb "- **Outcome:** ${OUTCOME}"
+                appendb "- **AI fix applied:** ${AI_FIX_APPLIED}"
+                appendb "- **Forced install (--legacy-peer-deps):** ${LEGACY_USED_STR}"
+                appendb ""
+                if [ -n "$PINS_DETAILS" ]; then
+                    appendb "## Consumers pinned to keep the framework current"
+                    appendb ""
+                    appendb "Held below their newest release because that release does not yet accept the framework at target. They advance automatically once upstream widens its peer range."
+                    appendb ""
+                    PR_BODY="${PR_BODY}${PINS_DETAILS}"$'\n'
+                fi
+                if [ "$AI_FIX_APPLIED" = "true" ]; then
+                    appendb "## AI-applied source fixes"
+                    appendb ""
+                    appendb "Applied by Claude Code and verified by a real build/test run before this PR opened. Claude was restricted to source/config only (blocked from tests/, package.json, package-lock.json). Review carefully."
+                    PR_BODY="${PR_BODY}${AI_FIX_SUMMARY}"$'\n'
+                fi
+                appendb "## Review Guidance"
+                case "$OUTCOME" in
+                    success)       appendb "Build and tests passed." ;;
+                    build_failing) appendb "Build fails and Claude could not fix it. A human needs to take over." ;;
+                    test_failing)  appendb "Tests fail and Claude could not fix them. Investigate before merging." ;;
+                esac
+                [ "$LEGACY_USED" = "1" ] && appendb "Install was forced with --legacy-peer-deps; the dependency tree may be technically invalid even though it installed. Review before merging."
+                appendb ""
+                appendb "Generated by run #${GITHUB_RUN_NUMBER}."
 
                 {
                     echo "attempts=$attempt"
                     echo "outcome=$OUTCOME"
                     echo "ai_fix_applied=$AI_FIX_APPLIED"
                     echo "legacy_used=$LEGACY_USED_STR"
-                    echo "ai_fix_summary<<EOF"; echo "$AI_FIX_SUMMARY"; echo "EOF"
-                    echo "pins_details<<EOF";   echo "$PINS_DETAILS";   echo "EOF"
+                    echo "pins_details<<PINEOF"; echo "$PINS_DETAILS"; echo "PINEOF"
+                    echo "pr_body<<PRBODYEOF"; echo "$PR_BODY"; echo "PRBODYEOF"
                 } >> $GITHUB_OUTPUT
 
             - name: Check for changes
@@ -391,137 +404,9 @@ ${stat}
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
                 commit-message: "chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})"
-                title: |
-                  ${{ steps.update.outputs.outcome == 'build_failing' && '⚠️ [BUILD FAILING] ' || steps.update.outputs.outcome == 'test_failing' && '⚠️ [TESTS FAILING] ' || '' }}${{ steps.update.outputs.ai_fix_applied == 'true' && '🤖 [AI FIX] ' || '' }}chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})
+                title: ${{ steps.update.outputs.outcome == 'build_failing' && '[BUILD FAILING] ' || steps.update.outputs.outcome == 'test_failing' && '[TESTS FAILING] ' || '' }}${{ steps.update.outputs.ai_fix_applied == 'true' && '[AI FIX] ' || '' }}chore ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})
                 labels: |
                   ${{ (steps.update.outputs.outcome == 'build_failing' || steps.update.outputs.outcome == 'test_failing') && 'dependencies,needs-review' || 'dependencies,automated' }}${{ steps.update.outputs.outcome == 'build_failing' && ',build-failing' || '' }}${{ steps.update.outputs.outcome == 'test_failing' && ',tests-failing' || '' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}${{ steps.update.outputs.ai_fix_applied == 'true' && ',ai-fix,needs-careful-review' || '' }}${{ steps.update.outputs.pins_details != '' && ',framework-pinned-deps' || '' }}${{ steps.update.outputs.legacy_used == 'true' && ',legacy-peer-deps' || '' }}
-                body: |
-                    Automatic dependency update. Policy: keep **${{ env.FRAMEWORK_NAME }}** at target; resolve peer conflicts by pinning blockers; hand build/test failures to Claude.
-
-                    ## Summary
-                    - **Framework:** `${{ env.FRAMEWORK_NAME }}` (kept at target)
-                    - **Update level:** `${{ inputs.update_level }}`
-                    - **Attempts:** ${{ steps.update.outputs.attempts }}
-                    - **Outcome:** ${{ steps.update.outputs.outcome }}
-                    - **AI fix applied:** ${{ steps.update.outputs.ai_fix_applied }}
-                    - **Forced install (--legacy-peer-deps):** ${{ steps.update.outputs.legacy_used }}
-
-                    ${{ steps.update.outputs.pins_details != '' && '## Consumers pinned to keep the framework current
-
-                    Held below their newest release because that release does not yet accept the framework at target. They advance automatically once upstream widens its peer range.
-' || '' }}
-                    ${{ steps.update.outputs.pins_details }}
-
-                    ${{ steps.update.outputs.ai_fix_applied == 'true' && '## 🤖 AI-applied source fixes
-
-                    Applied by Claude Code and **verified by a real build/test run** before this PR opened. Claude was restricted to source/config only — blocked from `tests/`, `package.json`, and `package-lock.json`. **Review carefully.**
-' || '' }}
-                    ${{ steps.update.outputs.ai_fix_summary }}
-
-                    ## Review Guidance
-                    ${{ steps.update.outputs.legacy_used == 'true' && '⚠️ Install forced with `--legacy-peer-deps`; the dependency tree may be technically invalid even though it installed. Review before merging.' || '' }}
-                    ${{ steps.update.outputs.outcome == 'build_failing' && '⚠️ **Build fails and Claude could not fix it.** A human needs to take over.' || '' }}
-                    ${{ steps.update.outputs.outcome == 'test_failing' && '⚠️ **Tests fail and Claude could not fix them.** Investigate before merging.' || '' }}
-                    ${{ steps.update.outputs.outcome == 'success' && '✅ Build and tests passed.' || '' }}
-
-                    Generated by run #${{ github.run_number }}.
+                body: ${{ steps.update.outputs.pr_body }}
                 branch: chore/deps-${{ env.FRAMEWORK_NAME }}-${{ inputs.update_level }}-${{ github.run_id }}
                 delete-branch: true
-          - minor
-          - latest
-
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    env:
-      HUSKY: 0
-      FRAMEWORK_NAME: cypress
-      # Required for AI escalation. Add under Settings → Secrets → Actions.
-      # If unset, the workflow still runs — it just skips the AI fallback.
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      AI_MODEL: 'claude-sonnet-4-6'
-      AI_MAX_ATTEMPTS: '2'
-      # If no plugin release >= its current version accepts the new framework
-      # version, allow pinning an older-but-compatible plugin release instead of
-      # falling back to --legacy-peer-deps. Default false (safer for an update PR).
-      ALLOW_PLUGIN_DOWNGRADE: 'false'
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v5
-        with:
-          node-version: '20'
-          cache: 'npm'
-
-      - name: Install dependencies (baseline)
-        run: |
-          set -o pipefail
-          npm ci 2>&1 | tee /tmp/install.log
-
-      - name: Update, build, and test with self-healing (co-upgrade + AI escalation)
-        id: update
-        shell: bash
-        env:
-          # The ONLY templated value the script needs — passed as an env var so the
-          # script body contains no ${{ }} (that is what tripped the 21000-char limit).
-          UPDATE_LEVEL: ${{ inputs.update_level }}
-        run: bash .github/scripts/update-deps.sh
-
-      - name: Check for changes
-        id: changed
-        run: |
-          if git diff --quiet package.json package-lock.json; then
-              echo "had_changes=false" >> $GITHUB_OUTPUT
-              echo "::notice::No dependency updates were available this run"
-          else
-              echo "had_changes=true" >> $GITHUB_OUTPUT
-              echo "Changes detected — will create PR"
-          fi
-
-      - name: Create Pull Request
-        if: steps.changed.outputs.had_changes == 'true'
-        uses: peter-evans/create-pull-request@v7
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          commit-message: "chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})"
-          title: >-
-            ${{ (steps.update.outputs.test_outcome == 'failure' || steps.update.outputs.forced_legacy == '1') && '⚠️ [NEEDS REVIEW] ' || '' }}chore: ${{ env.FRAMEWORK_NAME }} dependency update (${{ inputs.update_level }})
-          labels: >-
-            ${{ (steps.update.outputs.test_outcome == 'failure' || steps.update.outputs.forced_legacy == '1' || steps.update.outputs.ai_used != '0') && 'dependencies,needs-review' || 'dependencies,automated' }}${{ steps.update.outputs.test_outcome == 'failure' && ',tests-failing' || '' }}${{ steps.update.outputs.forced_legacy == '1' && ',forced-peer-deps' || '' }}${{ steps.update.outputs.ai_used != '0' && ',ai-assisted' || '' }}${{ inputs.update_level == 'latest' && ',major-update' || '' }}
-          body: |
-            Automatic dependency update via self-healing workflow.
-
-            ## Update Summary
-            - **Framework focus:** `${{ env.FRAMEWORK_NAME }}`
-            - **Update level:** `${{ inputs.update_level }}`
-            - **Main-loop attempts:** ${{ steps.update.outputs.attempts }}
-            - **Bisection trials:** ${{ steps.update.outputs.bisect_trials }}
-            - **Test result:** ${{ steps.update.outputs.test_outcome }}
-            - **Forced --legacy-peer-deps:** ${{ steps.update.outputs.forced_legacy == '1' && 'yes' || 'no' }}
-            - **AI escalation used:** ${{ steps.update.outputs.ai_used != '0' && format('yes ({0}x)', steps.update.outputs.ai_used) || 'no' }}
-
-            ## Co-upgraded for framework compatibility
-
-            ${{ steps.update.outputs.coupgrade_details || '_Nothing needed a co-upgrade this run._' }}
-
-            ## Held back from this run
-
-            ${{ steps.update.outputs.reject_details || '_All other available updates applied cleanly — nothing held back._' }}
-            ${{ steps.update.outputs.ai_used != '0' && format('{0}## 🤖 AI-assisted resolution{0}{0}> {1}{0}{0}The plan above was proposed by `{2}` and applied only after passing the same install/build/test gate as any other change. Every action was validated against the repo''s own dependency list; the framework was never eligible to be dropped.', '
-            ', steps.update.outputs.ai_diagnosis, env.AI_MODEL) || '' }}
-
-            ## Review Guidance
-            ${{ steps.update.outputs.test_outcome == 'failure' && '⚠️ **Tests failed even after bisecting available major bumps.** Likely a real regression — investigate before merging.' || '✅ Tests passed.' }}
-            ${{ steps.update.outputs.forced_legacy == '1' && '⚠️ **This PR used `--legacy-peer-deps`.** npm''s peer checks were bypassed because no compatible plugin release exists yet; tests are the only compatibility evidence. Confirm the plugin actually works with the new framework before merging.' || '' }}
-            ${{ steps.update.outputs.reject_details != '' && '⚠️ Held-back packages above need a coordinated manual update — read each migration guide before bumping.' || '' }}
-
-            Held-back and co-upgraded packages were discovered empirically this run — no static exclusion list is consulted. Generated by run #${{ github.run_number }}.
-          branch: chore/deps-${{ env.FRAMEWORK_NAME }}-${{ inputs.update_level }}-${{ github.run_id }}
-          delete-branch: true
